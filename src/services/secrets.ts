@@ -181,7 +181,7 @@ function findHighEntropyStrings(
   let match;
   while ((match = stringRegex.exec(content)) !== null) {
     const value = match[1];
-    if (calculateEntropy(value) > 4.5) {
+    if (value && calculateEntropy(value) > 4.5) {
       results.push({ value, index: match.index });
     }
   }

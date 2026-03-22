@@ -1,0 +1,35 @@
+export declare const SCAN_MAX_BUNDLED_LINES = 20000;
+export declare const SCAN_MAX_FILE_COUNT = 500;
+export declare const SCAN_MAX_FILE_SIZE_BYTES = 1048576;
+export declare const SCAN_LLM_MAX_TOKENS = 16384;
+export declare const SCAN_LLM_MODEL = "gpt-4";
+export declare const SCAN_LLM_TEMPERATURE = 0.1;
+export declare const SCAN_TIMEOUT_MS = 300000;
+export declare const SCAN_RATE_LIMIT_PER_MINUTE = 10;
+export declare const SCAN_FINDINGS_MAX = 100;
+export declare const SCAN_RATING_THRESHOLDS: {
+    readonly A: 90;
+    readonly B: 70;
+    readonly C: 50;
+    readonly D: 25;
+};
+export declare const SCAN_MINIMUM_RATING_FOR_DEPLOY: "C";
+export declare const SCAN_RATING_ORDER: readonly ["A", "B", "C", "D", "F"];
+export declare const SCAN_CATEGORY_WEIGHTS: {
+    readonly secrets: 0.3;
+    readonly prompt_injection: 0.25;
+    readonly dependencies: 0.2;
+    readonly permissions: 0.15;
+    readonly sast: 0.1;
+};
+export declare const SCAN_INCLUDE_EXTENSIONS: string[];
+export declare const SCAN_EXCLUDE_PATTERNS: string[];
+export type ScanRating = "A" | "B" | "C" | "D" | "F";
+export type ScanSeverity = "low" | "medium" | "high" | "critical";
+export type ScanCategory = "secrets" | "prompt_injection" | "dependencies" | "permissions" | "sast";
+export type ScanStatus = "pending" | "running" | "analyzing" | "completed" | "failed" | "review_required" | "approved" | "rejected";
+export type RiskLevel = "none" | "low" | "medium" | "high" | "critical";
+export type ColorLight = "green" | "yellow" | "orange" | "red" | "red_flashing";
+export declare const RATING_TO_COLOR: Record<ScanRating, ColorLight>;
+export declare const RATING_TO_LABEL: Record<ScanRating, string>;
+export declare const FINDING_TOOL_MAP: Record<ScanCategory, string>;
