@@ -1,3 +1,10 @@
+/**
+ * Get circuit breaker status for a provider
+ */
+export declare function getCircuitBreakerStatus(provider: string): {
+    state: string;
+    failures: number;
+} | undefined;
 export interface ScanFinding {
     severity: "low" | "medium" | "high" | "critical";
     category: "secrets" | "prompt_injection" | "dependencies" | "permissions" | "sast";

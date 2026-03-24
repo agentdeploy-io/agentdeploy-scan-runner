@@ -1,24 +1,24 @@
 import { z } from "zod";
 declare const envSchema: z.ZodObject<{
-    SCANNER_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    SCANNER_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     DIRECTUS_URL: z.ZodString;
-    DIRECTUS_ADMIN_TOKEN: z.ZodString;
+    DIRECTUS_ADMIN_TOKEN: z.ZodEffects<z.ZodString, string, string>;
     SCANNER_LLM_MODEL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
     SCANNER_LLM_FALLBACK_ORDER: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-    OPENROUTER_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    OPENROUTER_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     OPENROUTER_BASE_URL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-    CHUTES_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    CHUTES_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     CHUTES_BASE_URL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
     CHUTES_MODEL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-    GLM_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    GLM_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     GLM_BASE_URL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
     GLM_MODEL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-    NOVITA_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    NOVITA_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     NOVITA_BASE_URL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
     NOVITA_MODEL: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-    OPENAI_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodString>>;
+    OPENAI_API_KEY: z.ZodDefault<z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>>;
     GITHUB_APP_ID: z.ZodString;
-    GITHUB_APP_PRIVATE_KEY: z.ZodString;
+    GITHUB_APP_PRIVATE_KEY: z.ZodEffects<z.ZodString, string, string>;
     FRONTEND_URL: z.ZodDefault<z.ZodString>;
     PORT: z.ZodDefault<z.ZodNumber>;
 }, "strip", z.ZodTypeAny, {

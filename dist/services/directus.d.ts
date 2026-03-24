@@ -40,6 +40,28 @@ interface ScanFindingRecord {
     evidence?: Record<string, unknown>;
     status: "open";
 }
+export interface DirectusErrorBody {
+    error?: {
+        code?: string;
+        message?: string;
+        collection?: string;
+        action?: string;
+        role?: string;
+    };
+}
+export declare class DirectusForbiddenError extends Error {
+    readonly collection?: string;
+    readonly action?: string;
+    readonly role?: string;
+    readonly fields?: string[];
+    readonly statusCode = 403;
+    constructor(message: string, options?: {
+        collection?: string;
+        action?: string;
+        role?: string;
+        fields?: string[];
+    });
+}
 export declare function directusRequest<T>(path: string, options?: RequestInit): Promise<T>;
 export declare function createScanJob(record: ScanJobRecord): Promise<{
     id: string;

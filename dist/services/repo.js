@@ -5,22 +5,81 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
-import { SCAN_MAX_FILE_COUNT, SCAN_MAX_FILE_SIZE_BYTES, SCAN_INCLUDE_EXTENSIONS, SCAN_EXCLUDE_PATTERNS, } from "../constants.js";
+import { SCAN_INCLUDE_EXTENSIONS, SCAN_INCLUDE_FILES, SCAN_EXCLUDE_PATTERNS, SCAN_MAX_FILE_COUNT, SCAN_MAX_FILE_SIZE_BYTES, } from "../constants.js";
+const tokenCache = new Map();
+const TOKEN_TTL = 3600000; // 1 hour in milliseconds
+const TOKEN_BUFFER = 60000; // 1 minute buffer before expiry
+/**
+ * Get a cached token or fetch a new one if expired
+ */
+async function getCachedInstallationToken(appId, privateKey, owner) {
+    const cacheKey = `${appId}:${owner}`;
+    const cached = tokenCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+        logger.debug({ owner }, "Using cached GitHub installation token");
+        return cached.token;
+    }
+    // Fetch new token
+    const token = await getInstallationToken(appId, privateKey, owner);
+    tokenCache.set(cacheKey, {
+        token,
+        expiresAt: Date.now() + TOKEN_TTL - TOKEN_BUFFER
+    });
+    logger.info({ owner }, "Fetched new GitHub installation token (cached for 1 hour)");
+    return token;
+}
+/**
+ * Clear cached token for a specific owner
+ */
+export function clearTokenCache(owner) {
+    if (owner) {
+        // Clear tokens for specific owner (need to iterate as we don't store appId in key)
+        for (const [key, value] of tokenCache.entries()) {
+            if (key.endsWith(`:${owner}`)) {
+                tokenCache.delete(key);
+            }
+        }
+    }
+    else {
+        tokenCache.clear();
+    }
+}
 function shouldIncludeFile(filePath) {
     const normalized = filePath.replace(/\\/g, "/");
     for (const pattern of SCAN_EXCLUDE_PATTERNS) {
         if (normalized.includes(pattern))
             return false;
     }
+    // Check if file is in the include list (specific filenames)
+    const fileName = normalized.split("/").pop() || "";
+    if (SCAN_INCLUDE_FILES.some((f) => fileName === f))
+        return true;
     const ext = normalized.slice(normalized.lastIndexOf("."));
     return SCAN_INCLUDE_EXTENSIONS.includes(ext);
 }
 async function getInstallationToken(appId, privateKey, owner) {
     const { createAppAuth } = await import("@octokit/auth-app");
     const auth = createAppAuth({ appId, privateKey });
+    // First, get the installation ID for the repo owner
+    const appAuth = await auth({ type: "app" });
+    const installationsRes = await fetch("https://api.github.com/app/installations", {
+        headers: {
+            Authorization: `Bearer ${appAuth.token}`,
+            Accept: "application/vnd.github.v3+json",
+        },
+    });
+    if (!installationsRes.ok) {
+        throw new Error(`Failed to fetch installations: ${installationsRes.status}`);
+    }
+    const installations = await installationsRes.json();
+    const installation = installations.find((inst) => inst.account?.login?.toLowerCase() === owner.toLowerCase());
+    if (!installation) {
+        throw new Error(`No installation found for owner: ${owner}`);
+    }
+    // Now get the installation token
     const installationAuth = await auth({
         type: "installation",
-        installationId: undefined,
+        installationId: installation.id,
         owner,
     });
     return installationAuth.token;
@@ -39,7 +98,7 @@ export async function fetchRepoContents(sourceRepo) {
     const tempDir = join(tmpdir(), `scan-${hash}`);
     await mkdir(tempDir, { recursive: true });
     logger.info({ sourceRepo, tempDir }, "Fetching repository");
-    const token = await getInstallationToken(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY, owner);
+    const token = await getCachedInstallationToken(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY, owner);
     const tarUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/main`;
     const res = await fetch(tarUrl, {
         headers: {
@@ -112,12 +171,32 @@ async function collectFiles(dir) {
             const fullPath = join(currentDir, entry.name);
             const relativePath = fullPath.slice(dir.length + 1);
             if (entry.isDirectory()) {
-                if (!SCAN_EXCLUDE_PATTERNS.some((p) => relativePath.startsWith(p.replace("/", "")))) {
+                if (!SCAN_EXCLUDE_PATTERNS.some((p) => {
+                    // Match directory patterns like "node_modules/" or ".git/"
+                    if (p.endsWith("/")) {
+                        return relativePath.startsWith(p) || relativePath.startsWith(p.slice(0, -1));
+                    }
+                    return false;
+                })) {
                     await walk(fullPath);
                 }
                 continue;
             }
             if (!shouldIncludeFile(relativePath))
+                continue;
+            // Check if file matches exclude patterns
+            const fileName = entry.name;
+            if (SCAN_EXCLUDE_PATTERNS.some((p) => {
+                // Match exact filenames like "package-lock.json"
+                if (!p.includes("*")) {
+                    return fileName === p || relativePath === p;
+                }
+                // Match glob patterns like "*.lock"
+                if (p.startsWith("*.")) {
+                    return fileName.endsWith(p.slice(1));
+                }
+                return false;
+            }))
                 continue;
             const fileStat = await stat(fullPath);
             if (fileStat.size > SCAN_MAX_FILE_SIZE_BYTES)

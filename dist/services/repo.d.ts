@@ -1,3 +1,7 @@
+/**
+ * Clear cached token for a specific owner
+ */
+export declare function clearTokenCache(owner?: string): void;
 export interface RepoContents {
     tempDir: string;
     files: RepoFile[];

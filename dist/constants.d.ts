@@ -1,5 +1,5 @@
-export declare const SCAN_MAX_BUNDLED_LINES = 20000;
-export declare const SCAN_MAX_FILE_COUNT = 500;
+export declare const SCAN_MAX_BUNDLED_LINES = 200000;
+export declare const SCAN_MAX_FILE_COUNT = 1000;
 export declare const SCAN_MAX_FILE_SIZE_BYTES = 1048576;
 export declare const SCAN_LLM_MAX_TOKENS = 16384;
 export declare const SCAN_LLM_MODEL = "gpt-4";
@@ -23,6 +23,7 @@ export declare const SCAN_CATEGORY_WEIGHTS: {
     readonly sast: 0.1;
 };
 export declare const SCAN_INCLUDE_EXTENSIONS: string[];
+export declare const SCAN_INCLUDE_FILES: string[];
 export declare const SCAN_EXCLUDE_PATTERNS: string[];
 export type ScanRating = "A" | "B" | "C" | "D" | "F";
 export type ScanSeverity = "low" | "medium" | "high" | "critical";

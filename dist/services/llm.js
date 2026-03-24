@@ -2,7 +2,63 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
+import { safeLogContext } from "../lib/redact.js";
 import { SCAN_LLM_MAX_TOKENS, SCAN_LLM_TEMPERATURE, SCAN_TIMEOUT_MS, } from "../constants.js";
+const circuitBreakers = new Map();
+const CIRCUIT_FAILURE_THRESHOLD = 5;
+const CIRCUIT_RESET_TIMEOUT = 60000; // 1 minute
+/**
+ * Check if a provider should be tried based on circuit breaker state
+ */
+function shouldTryProvider(provider) {
+    const cb = circuitBreakers.get(provider);
+    if (!cb)
+        return true;
+    if (cb.state === "closed")
+        return true;
+    if (cb.state === "open" && Date.now() - cb.lastFailure > CIRCUIT_RESET_TIMEOUT) {
+        cb.state = "half-open";
+        logger.info({ provider }, "Circuit breaker entering half-open state");
+        return true;
+    }
+    return cb.state === "half-open";
+}
+/**
+ * Record a successful call - reset the circuit breaker
+ */
+function recordSuccess(provider) {
+    const cb = circuitBreakers.get(provider);
+    if (cb) {
+        cb.failures = 0;
+        cb.state = "closed";
+        logger.debug({ provider }, "Circuit breaker closed");
+    }
+}
+/**
+ * Record a failure - potentially open the circuit
+ */
+function recordFailure(provider) {
+    let cb = circuitBreakers.get(provider);
+    if (!cb) {
+        cb = { failures: 0, lastFailure: 0, state: "closed" };
+        circuitBreakers.set(provider, cb);
+    }
+    cb.failures++;
+    cb.lastFailure = Date.now();
+    if (cb.failures >= CIRCUIT_FAILURE_THRESHOLD) {
+        cb.state = "open";
+        logger.warn({ provider, failures: cb.failures }, "Circuit breaker opened - provider temporarily disabled");
+    }
+}
+/**
+ * Get circuit breaker status for a provider
+ */
+export function getCircuitBreakerStatus(provider) {
+    const cb = circuitBreakers.get(provider);
+    if (!cb)
+        return undefined;
+    return { state: cb.state, failures: cb.failures };
+}
 const findingSchema = z.object({
     severity: z.enum(["low", "medium", "high", "critical"]),
     category: z.enum(["secrets", "prompt_injection", "dependencies", "permissions", "sast"]),
@@ -164,6 +220,11 @@ export async function analyzeWithLLM(bundledCode) {
     const timeout = setTimeout(() => controller.abort(), SCAN_TIMEOUT_MS);
     let lastError;
     for (const provider of providers) {
+        // Check circuit breaker before trying provider
+        if (!shouldTryProvider(provider.name)) {
+            logger.info({ provider: provider.name }, "Circuit breaker open - skipping provider");
+            continue;
+        }
         try {
             logger.info({ provider: provider.name, model: provider.model, codeLength: truncatedCode.length }, "Trying LLM provider");
             const client = new OpenAI({
@@ -191,7 +252,7 @@ export async function analyzeWithLLM(bundledCode) {
                 ],
                 response_format: { type: "json_object" },
             }, { signal: controller.signal });
-            const content = response.choices[0]?.message?.content;
+            const content = response.choices[0]?.message?.content || response.choices[0]?.message?.reasoning;
             if (!content) {
                 throw new Error("Empty LLM response");
             }
@@ -202,6 +263,8 @@ export async function analyzeWithLLM(bundledCode) {
                 tool: `llm-${provider.name}`,
                 evidence: f.evidence ? { snippet: f.evidence } : undefined,
             }));
+            // Record success for circuit breaker
+            recordSuccess(provider.name);
             logger.info({ provider: provider.name, findings: findings.length }, "LLM analysis complete");
             clearTimeout(timeout);
             return {
@@ -213,17 +276,19 @@ export async function analyzeWithLLM(bundledCode) {
         }
         catch (err) {
             lastError = err;
+            // Record failure for circuit breaker
+            recordFailure(provider.name);
             if (err instanceof DOMException && err.name === "AbortError") {
-                logger.error({ provider: provider.name }, "LLM provider timed out — skipping remaining");
+                logger.error(safeLogContext({ provider: provider.name }), "LLM provider timed out — skipping remaining");
                 break;
             }
-            logger.warn({ provider: provider.name, error: err instanceof Error ? err.message : String(err) }, "LLM provider failed, trying next");
+            logger.warn(safeLogContext({ provider: provider.name, error: err instanceof Error ? err.message : String(err) }), "LLM provider failed, trying next");
         }
     }
     clearTimeout(timeout);
     if (lastError instanceof DOMException && lastError.name === "AbortError") {
         throw new Error("LLM analysis timed out on all providers");
     }
-    logger.error({ lastError }, "All LLM providers failed");
+    logger.error(safeLogContext({ lastError: lastError instanceof Error ? { message: lastError.message, name: lastError.name } : String(lastError) }), "All LLM providers failed");
     throw lastError instanceof Error ? lastError : new Error("All LLM providers failed");
 }
