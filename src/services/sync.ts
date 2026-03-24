@@ -7,6 +7,45 @@ import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
 import { directusRequest } from "./directus.js";
 
+// ─── GitHub Token Caching ───────────────────────────────────────────────
+
+interface CachedToken {
+  token: string;
+  expiresAt: number;
+}
+
+const tokenCache = new Map<string, CachedToken>();
+const TOKEN_TTL = 3600000; // 1 hour in milliseconds
+const TOKEN_BUFFER = 60000; // 1 minute buffer before expiry
+
+/**
+ * Get a cached token or fetch a new one if expired
+ */
+async function getCachedInstallationToken(
+  appId: string,
+  privateKey: string,
+  owner: string
+): Promise<string> {
+  const cacheKey = `${appId}:${owner}`;
+  const cached = tokenCache.get(cacheKey);
+  
+  if (cached && Date.now() < cached.expiresAt) {
+    logger.debug({ owner }, "Using cached GitHub installation token")
+    return cached.token;
+  }
+  
+  // Fetch new token
+  const token = await getInstallationToken(appId, privateKey, owner);
+  
+  tokenCache.set(cacheKey, {
+    token,
+    expiresAt: Date.now() + TOKEN_TTL - TOKEN_BUFFER
+  });
+  
+  logger.info({ owner }, "Fetched new GitHub installation token (cached for 1 hour)")
+  return token;
+}
+
 export interface SyncResult {
   passoverId: string;
   buyerRepo: string;
@@ -170,7 +209,7 @@ export async function syncToNewVersion(
     // 3. Get GitHub App token for buyer's repo
     const buyerParts = passover.buyer_repo.split("/");
     const buyerOwner = buyerParts[0]!;
-    const buyerToken = await getInstallationToken(
+    const buyerToken = await getCachedInstallationToken(
       env.GITHUB_APP_ID,
       env.GITHUB_APP_PRIVATE_KEY,
       buyerOwner
@@ -184,7 +223,7 @@ export async function syncToNewVersion(
       const sellerParts = passover.seller_repo.split("/");
       const sellerOwner = sellerParts[0]!;
       const sellerRepoName = sellerParts[1]!;
-      const sellerToken = await getInstallationToken(
+      const sellerToken = await getCachedInstallationToken(
         env.GITHUB_APP_ID,
         env.GITHUB_APP_PRIVATE_KEY,
         sellerOwner

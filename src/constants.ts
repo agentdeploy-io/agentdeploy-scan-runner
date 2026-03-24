@@ -1,5 +1,5 @@
-export const SCAN_MAX_BUNDLED_LINES = 20000;
-export const SCAN_MAX_FILE_COUNT = 500;
+export const SCAN_MAX_BUNDLED_LINES = 200000;
+export const SCAN_MAX_FILE_COUNT = 1000;
 export const SCAN_MAX_FILE_SIZE_BYTES = 1048576; // 1MB per file
 export const SCAN_LLM_MAX_TOKENS = 16384;
 export const SCAN_LLM_MODEL = "gpt-4";
@@ -32,18 +32,27 @@ export const SCAN_INCLUDE_EXTENSIONS = [
   ".py",
   ".go",
   ".rs",
-  ".json",
   ".yml",
   ".yaml",
-  ".md",
   ".toml",
+];
+
+export const SCAN_INCLUDE_FILES = [
+  "package.json",
+  "tsconfig.json",
+  "docker-compose.yml",
+  "Dockerfile",
 ];
 
 export const SCAN_EXCLUDE_PATTERNS = [
   ".git/",
   "node_modules/",
-  "*.lock",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "bun.lockb",
   "*.min.js",
+  "*.min.css",
   "*.png",
   "*.jpg",
   "*.jpeg",
@@ -62,6 +71,8 @@ export const SCAN_EXCLUDE_PATTERNS = [
   "*.pdf",
   "*.exe",
   "*.bin",
+  ".DS_Store",
+  "Thumbs.db",
 ];
 
 export type ScanRating = "A" | "B" | "C" | "D" | "F";

@@ -1,5 +1,6 @@
 import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
+import { redactSecrets, safeLogContext } from "../lib/redact.js";
 import type {
   ScanStatus,
   ScanRating,
@@ -52,6 +53,41 @@ interface ScanFindingRecord {
   status: "open";
 }
 
+export interface DirectusErrorBody {
+  error?: {
+    code?: string;
+    message?: string;
+    collection?: string;
+    action?: string;
+    role?: string;
+  };
+}
+
+export class DirectusForbiddenError extends Error {
+  public readonly collection?: string;
+  public readonly action?: string;
+  public readonly role?: string;
+  public readonly fields?: string[];
+  public readonly statusCode = 403;
+
+  constructor(
+    message: string,
+    options?: {
+      collection?: string;
+      action?: string;
+      role?: string;
+      fields?: string[];
+    }
+  ) {
+    super(message);
+    this.name = "DirectusForbiddenError";
+    this.collection = options?.collection;
+    this.action = options?.action;
+    this.role = options?.role;
+    this.fields = options?.fields;
+  }
+}
+
 export async function directusRequest<T>(
   path: string,
   options: RequestInit = {}
@@ -70,12 +106,81 @@ export async function directusRequest<T>(
 
   if (!res.ok) {
     const body = await res.text();
-    logger.error({ status: res.status, path, body }, "Directus request failed");
-    throw new Error(`Directus ${res.status}: ${path}`);
+    let errorBody: DirectusErrorBody | null = null;
+
+    try {
+      errorBody = JSON.parse(body) as DirectusErrorBody;
+    } catch {
+      // Body is not JSON, ignore
+    }
+
+    const errorContext = {
+      status: res.status,
+      path,
+      method: options.method || "GET",
+      // Don't log full responseBody - it might contain sensitive data
+      errorCode: errorBody?.error?.code,
+      errorMessage: errorBody?.error?.message,
+      collection: errorBody?.error?.collection,
+      action: errorBody?.error?.action,
+      role: errorBody?.error?.role,
+    };
+
+    // Handle 403 Forbidden with detailed permission error
+    if (res.status === 403) {
+      const collection = extractCollectionFromPath(path);
+      const action = extractActionFromMethod(options.method || "GET");
+
+      logger.error(
+        safeLogContext({ ...errorContext, collection, action }),
+        "Directus 403 Forbidden - Permission denied"
+      );
+
+      throw new DirectusForbiddenError(
+        errorBody?.error?.message || `You do not have permission to ${action} ${collection}`,
+        {
+          collection,
+          action,
+          role: errorBody?.error?.role,
+        }
+      );
+    }
+
+    // Handle other errors - redact secrets from context
+    logger.error(safeLogContext(errorContext), "Directus request failed");
+    throw new Error(`Directus ${res.status}: ${path} - ${errorBody?.error?.message || body}`);
   }
 
   const json = (await res.json()) as { data: T };
   return json.data;
+}
+
+/**
+ * Extract collection name from Directus API path
+ * e.g., /items/sellers/123 -> sellers
+ */
+function extractCollectionFromPath(path: string): string | undefined {
+  const match = path.match(/^\/items\/([^/]+)/);
+  return match?.[1];
+}
+
+/**
+ * Extract action type from HTTP method
+ */
+function extractActionFromMethod(method: string): string {
+  switch (method.toUpperCase()) {
+    case "GET":
+      return "read";
+    case "POST":
+      return "create";
+    case "PATCH":
+    case "PUT":
+      return "update";
+    case "DELETE":
+      return "delete";
+    default:
+      return method.toLowerCase();
+  }
 }
 
 export async function createScanJob(
@@ -140,11 +245,43 @@ export async function updateSellerSecurityFields(
     scan_compliant: boolean;
   }
 ): Promise<void> {
-  await directusRequest(`/items/sellers/${sellerId}`, {
-    method: "PATCH",
-    body: JSON.stringify(fields),
-  });
-  logger.info({ sellerId }, "Seller security fields updated");
+  const fieldNames = Object.keys(fields);
+  logger.info(
+    { sellerId, fields: fieldNames, fieldValues: fields },
+    "Updating seller security fields"
+  );
+
+  try {
+    await directusRequest(`/items/sellers/${sellerId}`, {
+      method: "PATCH",
+      body: JSON.stringify(fields),
+    });
+    logger.info({ sellerId, fields: fieldNames }, "Seller security fields updated");
+  } catch (error) {
+    if (error instanceof DirectusForbiddenError) {
+      logger.error(
+        {
+          sellerId,
+          fields: fieldNames,
+          collection: error.collection,
+          action: error.action,
+          role: error.role,
+          errorMessage: error.message,
+        },
+        "❌ Permission denied when updating seller security fields"
+      );
+      throw new Error(
+        `Permission denied: Cannot update seller fields. Missing permission for ${error.collection}.${error.action}. ` +
+        `Required fields: ${fieldNames.join(", ")}. ` +
+        `Contact admin to grant update permission on sellers collection.`
+      );
+    }
+    logger.error(
+      { sellerId, fields: fieldNames, error },
+      "Failed to update seller security fields"
+    );
+    throw error;
+  }
 }
 
 export async function getScanJob(

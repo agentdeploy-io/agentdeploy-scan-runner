@@ -4,6 +4,7 @@ import { authMiddleware } from "../middleware/auth.js";
 import { rateLimitMiddleware } from "../middleware/rate-limit.js";
 import { getScanJob } from "../services/directus.js";
 import { logger } from "../logger.js";
+import { createErrorResponse, ErrorCodes } from "../lib/errors.js";
 
 const rescanRequestSchema = z.object({
   scanJobId: z.string().min(1),
@@ -17,12 +18,10 @@ rescanRoute.post("/rescan", authMiddleware, rateLimitMiddleware, async (c) => {
 
   if (!parsed.success) {
     return c.json(
-      {
-        error: {
-          code: "VALIDATION_ERROR",
-          message: parsed.error.issues.map((i) => i.message).join(", "),
-        },
-      },
+      createErrorResponse(
+        ErrorCodes.VALIDATION_ERROR,
+        parsed.error.issues.map((i) => i.message).join(", ")
+      ),
       400
     );
   }
@@ -60,7 +59,7 @@ rescanRoute.post("/rescan", authMiddleware, rateLimitMiddleware, async (c) => {
   } catch (err) {
     logger.error({ err, scanJobId }, "Rescan failed");
     return c.json(
-      { error: { code: "RESCAN_FAILED", message: "Rescan execution failed" } },
+      createErrorResponse("RESCAN_FAILED", "Rescan execution failed"),
       500
     );
   }
