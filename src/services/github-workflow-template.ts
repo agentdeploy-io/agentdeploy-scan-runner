@@ -1,0 +1,302 @@
+const WORKFLOW_YAML = `name: Agentic Security Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_job_id:
+        description: 'Scan job identifier from AgentDeploy'
+        required: true
+      report_title:
+        description: 'Title for generated report'
+        required: true
+      source_repo:
+        description: 'owner/repo to scan (optional; defaults to current repo)'
+        required: false
+      source_installation_id:
+        description: 'GitHub App installation id for source repo (optional)'
+        required: false
+      template_id:
+        description: 'Template id in AgentDeploy (optional)'
+        required: false
+      seller_id:
+        description: 'Seller user id in AgentDeploy (optional)'
+        required: false
+
+jobs:
+  secure_scan_and_report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+
+    steps:
+      - name: Resolve source repository
+        id: source-repo
+        shell: bash
+        run: |
+          SOURCE_REPO="\${{ github.event.inputs.source_repo }}"
+          if [ -z "$SOURCE_REPO" ]; then
+            SOURCE_REPO="\${{ github.repository }}"
+          fi
+
+          OWNER="\${SOURCE_REPO%%/*}"
+          REPO="\${SOURCE_REPO#*/}"
+          if [ -z "$OWNER" ] || [ -z "$REPO" ] || [ "$OWNER" = "$SOURCE_REPO" ]; then
+            echo "Invalid source repo: $SOURCE_REPO" >&2
+            exit 1
+          fi
+
+          echo "full=$SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "name=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub App token for source repository
+        id: source-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: \${{ vars.GITHUB_APP_ID }}
+          private-key: \${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          owner: \${{ steps.source-repo.outputs.owner }}
+          repositories: \${{ steps.source-repo.outputs.name }}
+
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: \${{ steps.source-repo.outputs.full }}
+          token: \${{ steps.source-token.outputs.token }}
+          fetch-depth: 1
+
+      - name: Run TruffleHog
+        id: trufflehog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --results=verified,unknown
+        continue-on-error: true
+
+      - name: Run Semgrep
+        id: semgrep
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep --config p/security-audit --error
+        continue-on-error: true
+
+      - name: Run SecurityLab Taskflow Agent
+        id: seclab
+        shell: bash
+        env:
+          AI_API_TOKEN: \${{ secrets.AI_API_TOKEN }}
+          GH_TOKEN: \${{ steps.source-token.outputs.token }}
+        run: |
+          if [ -z "$AI_API_TOKEN" ]; then
+            echo "status=missing_ai_api_token" >> "$GITHUB_OUTPUT"
+            echo "AI_API_TOKEN is not configured; SecurityLab taskflow scan was not executed." > seclab-taskflow-output.txt
+            exit 0
+          fi
+
+          if ! docker pull ghcr.io/githubsecuritylab/seclab-taskflow-agent:latest > seclab-taskflow-output.txt 2>&1; then
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! docker run --rm \
+            -e AI_API_TOKEN="$AI_API_TOKEN" \
+            -e GH_TOKEN="$GH_TOKEN" \
+            ghcr.io/githubsecuritylab/seclab-taskflow-agent:latest \
+            -p seclab_taskflow_agent.personalities.assistant \
+            "Analyze repository \${{ steps.source-repo.outputs.full }} for agent-security risks. Focus on prompt injection paths, dependency/supply-chain exposure, and permission abuse risk. Return concise findings with severity labels." \
+            >> seclab-taskflow-output.txt 2>&1; then
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "status=executed" >> "$GITHUB_OUTPUT"
+
+      - name: Compile markdown report
+        run: |
+          TRUFFLEHOG_OUTCOME="\${{ steps.trufflehog.outcome }}"
+          SEMGREP_OUTCOME="\${{ steps.semgrep.outcome }}"
+          SECLAB_STATUS="\${{ steps.seclab.outputs.status }}"
+
+          TRUFFLEHOG_DISPLAY="⚠️ Scan Failed"
+          SEMGREP_DISPLAY="⚠️ Scan Failed"
+          SECLAB_DISPLAY="⚠️ Scan Failed"
+
+          if [ "$TRUFFLEHOG_OUTCOME" = "success" ]; then
+            TRUFFLEHOG_DISPLAY="✅ No Findings"
+          elif [ "$TRUFFLEHOG_OUTCOME" = "failure" ]; then
+            TRUFFLEHOG_DISPLAY="🔴 Findings Detected"
+          fi
+
+          if [ "$SEMGREP_OUTCOME" = "success" ]; then
+            SEMGREP_DISPLAY="✅ No Findings"
+          elif [ "$SEMGREP_OUTCOME" = "failure" ]; then
+            SEMGREP_DISPLAY="🔴 Findings Detected"
+          fi
+
+          if [ "$SECLAB_STATUS" = "executed" ]; then
+            SECLAB_DISPLAY="✅ Completed"
+          elif [ "$SECLAB_STATUS" = "missing_ai_api_token" ]; then
+            SECLAB_DISPLAY="🟡 Not Configured"
+          elif [ "$SECLAB_STATUS" = "failed" ]; then
+            SECLAB_DISPLAY="⚠️ Execution Failed"
+          fi
+
+          echo "# \${{ github.event.inputs.report_title }}" > report.md
+          echo "" >> report.md
+          echo "- Scan Job ID: \${{ github.event.inputs.scan_job_id }}" >> report.md
+          echo "- Template ID: \${{ github.event.inputs.template_id || 'n/a' }}" >> report.md
+          echo "- Seller ID: \${{ github.event.inputs.seller_id || 'n/a' }}" >> report.md
+          echo "- Repository: \${{ steps.source-repo.outputs.full }}" >> report.md
+          echo "- Run ID: \${{ github.run_id }}" >> report.md
+          echo "- Completed At: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> report.md
+          echo "" >> report.md
+          echo "## Security Tool Results" >> report.md
+          echo "- TruffleHog: $TRUFFLEHOG_DISPLAY" >> report.md
+          echo "- Semgrep: $SEMGREP_DISPLAY" >> report.md
+          echo "- SecurityLab Taskflow Agent: $SECLAB_DISPLAY" >> report.md
+          echo "" >> report.md
+          echo "Review workflow logs and artifact outputs for full findings." >> report.md
+          if [ -f seclab-taskflow-output.txt ]; then
+            echo "" >> report.md
+            echo "### SecurityLab Taskflow Agent Output (excerpt)" >> report.md
+            echo '\`\`\`text' >> report.md
+            head -n 80 seclab-taskflow-output.txt >> report.md
+            echo '\`\`\`' >> report.md
+          fi
+
+      - name: Build machine-readable scan result
+        run: |
+          TRUFFLEHOG_STATUS="\${{ steps.trufflehog.outcome }}"
+          SEMGREP_STATUS="\${{ steps.semgrep.outcome }}"
+          SECLAB_STATUS="\${{ steps.seclab.outputs.status }}"
+
+          SECRETS_RATING="A"
+          SAST_RATING="A"
+          PROMPT_INJECTION_RATING="A"
+          DEPENDENCIES_RATING="A"
+          PERMISSIONS_RATING="A"
+          OVERALL_RATING="A"
+          OVERALL_SCORE=95
+          RISK_LEVEL="none"
+
+          TOOL_FINDINGS=0
+          HIGH_COUNT=0
+          MEDIUM_COUNT=0
+          CRITICAL_COUNT=0
+
+          if [ "$TRUFFLEHOG_STATUS" != "success" ]; then
+            SECRETS_RATING="C"
+            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+            HIGH_COUNT=1
+          fi
+
+          if [ "$SEMGREP_STATUS" != "success" ]; then
+            SAST_RATING="C"
+            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+            HIGH_COUNT=$((HIGH_COUNT + 1))
+          fi
+
+          if [ "$SECLAB_STATUS" = "missing_ai_api_token" ] || [ "$SECLAB_STATUS" = "failed" ]; then
+            PROMPT_INJECTION_RATING="B"
+            DEPENDENCIES_RATING="B"
+            PERMISSIONS_RATING="B"
+            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
+          elif [ "$SECLAB_STATUS" = "executed" ] && [ -f seclab-taskflow-output.txt ]; then
+            if grep -Eiq '(critical|remote code execution|token exfiltration|privilege escalation)' seclab-taskflow-output.txt; then
+              PROMPT_INJECTION_RATING="C"
+              DEPENDENCIES_RATING="C"
+              PERMISSIONS_RATING="C"
+              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+              CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
+            elif grep -Eiq '(high|command injection|sql injection|supply chain|dependency confusion)' seclab-taskflow-output.txt; then
+              PROMPT_INJECTION_RATING="C"
+              DEPENDENCIES_RATING="C"
+              PERMISSIONS_RATING="C"
+              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+              HIGH_COUNT=$((HIGH_COUNT + 1))
+            elif grep -Eiq '(medium|moderate|unsafe default|weak validation)' seclab-taskflow-output.txt; then
+              PROMPT_INJECTION_RATING="B"
+              DEPENDENCIES_RATING="B"
+              PERMISSIONS_RATING="B"
+              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+              MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
+            fi
+          fi
+
+          if [ "$TOOL_FINDINGS" -eq 0 ]; then
+            OVERALL_RATING="A"
+            OVERALL_SCORE=95
+            RISK_LEVEL="none"
+          elif [ "$TOOL_FINDINGS" -eq 1 ]; then
+            OVERALL_RATING="B"
+            OVERALL_SCORE=82
+            RISK_LEVEL="low"
+            if [ "$HIGH_COUNT" -gt 0 ] || [ "$CRITICAL_COUNT" -gt 0 ]; then
+              OVERALL_SCORE=78
+              RISK_LEVEL="medium"
+            fi
+          else
+            OVERALL_RATING="C"
+            OVERALL_SCORE=66
+            RISK_LEVEL="medium"
+            if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 1 ]; then
+              OVERALL_SCORE=58
+              RISK_LEVEL="high"
+            fi
+          fi
+
+          cat > scan-result.json <<EOF
+          {
+            "overallRating": "$OVERALL_RATING",
+            "overallScore": $OVERALL_SCORE,
+            "riskLevel": "$RISK_LEVEL",
+            "severityCounts": {
+              "low": 0,
+              "medium": $MEDIUM_COUNT,
+              "high": $HIGH_COUNT,
+              "critical": $CRITICAL_COUNT
+            },
+            "categoryRatings": {
+              "secrets": "$SECRETS_RATING",
+              "promptInjection": "$PROMPT_INJECTION_RATING",
+              "dependencies": "$DEPENDENCIES_RATING",
+              "permissions": "$PERMISSIONS_RATING",
+              "sast": "$SAST_RATING"
+            },
+            "summary": "Automated workflow scan completed using TruffleHog, Semgrep, and SecurityLab taskflow agent. Inspect workflow logs and artifacts for full output.",
+            "recommendations": [
+              "Review workflow logs and repository findings in detail.",
+              "Ensure AI_API_TOKEN is configured so SecurityLab taskflow agent runs on every scan.",
+              "Address any non-success tool outcomes before publishing."
+            ]
+          }
+          EOF
+
+      - name: Convert markdown to PDF
+        uses: baileyjm02/markdown-to-pdf@v1
+        with:
+          input_path: report.md
+          output_dir: pdf_output
+          theme: github
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Certified-Security-Report
+          path: |
+            pdf_output/report.pdf
+            scan-result.json
+            seclab-taskflow-output.txt
+          retention-days: 7
+`;
+
+export const WORKFLOW_PATH = ".github/workflows/agent-security-scan.yml";
+
+export function getWorkflowYaml(): string {
+  return WORKFLOW_YAML;
+}

@@ -20,6 +20,23 @@ const nonEmptyStringWithQuoteStrip = z.string().min(1).transform((s) => {
 const envSchema = z.object({
     // Auth (optional for local dev, required in production)
     SCANNER_API_KEY: stripTrailingQuote.optional().default(""),
+    SCAN_WS_TOKEN_SECRET: stripTrailingQuote.optional().default(""),
+    SCAN_MAX_ACTIVE_TEMPLATES_PER_USER: z.coerce.number().int().min(1).max(10).default(3),
+    SCAN_MAX_PARALLEL_JOBS_PER_INSTANCE: z.coerce.number().int().min(1).max(100).default(6),
+    SCAN_MAX_QUEUE_JOBS_PER_INSTANCE: z.coerce.number().int().min(1).max(10000).default(500),
+    SCAN_ACTIVE_JOB_TTL_MINUTES: z.coerce.number().int().min(5).max(24 * 60).default(120),
+    SCAN_WORKDIR: z.string().optional().default(""),
+    SCAN_PROVIDER: z
+        .enum(["github_actions", "github_actions_platform", "local"])
+        .default("github_actions"),
+    GITHUB_WEBHOOK_SECRET: stripTrailingQuote.optional().default(""),
+    GITHUB_WORKFLOW_FILE: z.string().optional().default("agent-security-scan.yml"),
+    GITHUB_WORKFLOW_NAME: z.string().optional().default("Agentic Security Scan"),
+    GITHUB_SCAN_ARTIFACT_NAME: z.string().optional().default("Certified-Security-Report"),
+    GITHUB_SCAN_RESULT_FILE_NAME: z.string().optional().default("scan-result.json"),
+    GITHUB_PLATFORM_WORKFLOW_OWNER: z.string().optional().default(""),
+    GITHUB_PLATFORM_WORKFLOW_REPO: z.string().optional().default(""),
+    GITHUB_PLATFORM_WORKFLOW_REF: z.string().optional().default("main"),
     // Directus
     DIRECTUS_URL: z.string().url(),
     DIRECTUS_ADMIN_TOKEN: nonEmptyStringWithQuoteStrip,

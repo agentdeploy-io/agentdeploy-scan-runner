@@ -83,6 +83,74 @@ const llmResponseSchema = z.object({
     summary: z.string(),
     recommendations: z.array(z.string()),
 });
+function parseJsonFromAssistantContent(content) {
+    const trimmed = content.trim();
+    if (!trimmed) {
+        throw new Error("Empty LLM response");
+    }
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch {
+        // Some providers return JSON wrapped in markdown fences.
+        const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+        if (fenced?.[1]) {
+            return JSON.parse(fenced[1].trim());
+        }
+        // Last fallback: attempt to parse the first JSON object in the content.
+        const firstBrace = trimmed.indexOf("{");
+        const lastBrace = trimmed.lastIndexOf("}");
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+            const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+            return JSON.parse(candidate);
+        }
+        throw new Error("LLM response was not valid JSON");
+    }
+}
+function normalizeLetterGrade(value) {
+    if (typeof value !== "string")
+        return "C";
+    const raw = value.trim().toUpperCase();
+    const first = raw[0];
+    if (first === "A" || first === "B" || first === "C" || first === "D" || first === "F") {
+        return first;
+    }
+    if (first === "E")
+        return "F";
+    return "C";
+}
+function normalizeNumericScore(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed))
+        return 50;
+    return Math.max(0, Math.min(100, Math.round(parsed)));
+}
+function normalizeNumericFindings(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0)
+        return 0;
+    return Math.round(parsed);
+}
+function normalizeLlmPayload(raw) {
+    if (!raw || typeof raw !== "object")
+        return raw;
+    const payload = raw;
+    const ratingsRaw = payload.ratings;
+    if (!ratingsRaw || typeof ratingsRaw !== "object")
+        return payload;
+    const ratings = ratingsRaw;
+    const categories = ["secrets", "prompt_injection", "dependencies", "permissions", "sast"];
+    for (const category of categories) {
+        const nodeRaw = ratings[category];
+        if (!nodeRaw || typeof nodeRaw !== "object")
+            continue;
+        const node = nodeRaw;
+        node.rating = normalizeLetterGrade(node.rating);
+        node.score = normalizeNumericScore(node.score);
+        node.findings = normalizeNumericFindings(node.findings);
+    }
+    return payload;
+}
 function getAvailableProviders(env) {
     const providers = [];
     if (env.OPENROUTER_API_KEY) {
@@ -252,12 +320,13 @@ export async function analyzeWithLLM(bundledCode) {
                 ],
                 response_format: { type: "json_object" },
             }, { signal: controller.signal });
-            const content = response.choices[0]?.message?.content || response.choices[0]?.message?.reasoning;
+            const content = response.choices[0]?.message?.content;
             if (!content) {
                 throw new Error("Empty LLM response");
             }
-            const parsed = JSON.parse(content);
-            const validated = llmResponseSchema.parse(parsed);
+            const parsed = parseJsonFromAssistantContent(content);
+            const normalized = normalizeLlmPayload(parsed);
+            const validated = llmResponseSchema.parse(normalized);
             const findings = validated.findings.map((f) => ({
                 ...f,
                 tool: `llm-${provider.name}`,

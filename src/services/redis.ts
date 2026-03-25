@@ -54,6 +54,7 @@ export async function getRedisClient(): Promise<RedisClientType> {
 }
 
 export interface ScanProgressEvent {
+  jobId: string
   event_type: 'stage' | 'progress' | 'finding' | 'llm_chunk' | 'llm_thinking' | 'complete' | 'error'
   stage?: string
   message: string
@@ -93,20 +94,40 @@ export async function publishWithRetry(
 }
 
 export async function publishScanProgress(
-  templateId: string,
+  jobId: string,
   event: Omit<ScanProgressEvent, 'timestamp'>
 ): Promise<void> {
-  const channel = `scan:progress:${templateId}`
+  const channel = `scan:progress:${jobId}`
+  const stateKey = `scan:state:${jobId}`
   const fullEvent: ScanProgressEvent = {
     ...event,
     timestamp: new Date().toISOString(),
   }
 
+  try {
+    const pub = await getPublisher()
+    await pub.set(stateKey, JSON.stringify(fullEvent), { EX: 60 * 60 * 24 })
+  } catch (err) {
+    logger.warn({ err, jobId }, 'Failed to persist latest scan state in Redis')
+  }
+
   const success = await publishWithRetry(channel, fullEvent)
   if (success) {
-    logger.info({ templateId, event_type: event.event_type, stage: event.stage }, 'Published scan progress')
+    logger.info({ jobId, event_type: event.event_type, stage: event.stage }, 'Published scan progress')
   } else {
-    logger.error({ templateId, event_type: event.event_type, stage: event.stage }, 'Failed to publish scan progress after retries')
+    logger.error({ jobId, event_type: event.event_type, stage: event.stage }, 'Failed to publish scan progress after retries')
+  }
+}
+
+export async function getScanState(jobId: string): Promise<ScanProgressEvent | null> {
+  try {
+    const client = await getRedisClient()
+    const raw = await client.get(`scan:state:${jobId}`)
+    if (!raw) return null
+    return JSON.parse(raw) as ScanProgressEvent
+  } catch (err) {
+    logger.warn({ err, jobId }, 'Failed to read scan state from Redis')
+    return null
   }
 }
 

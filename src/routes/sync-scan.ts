@@ -22,7 +22,7 @@ import {
 import { logger } from "../logger.js";
 import { RATING_TO_COLOR } from "../constants.js";
 import type { ScanFinding } from "../services/llm.js";
-import { publishScanProgress } from "../services/redis.js";
+import { publishScanProgress, type ScanProgressEvent } from "../services/redis.js";
 
 const syncScanRequestSchema = z.object({
   templateId: z.string().min(1),
@@ -121,14 +121,6 @@ syncScanRoute.post(
 
     const startedAt = Date.now();
 
-    // Publish scan started event
-    await publishScanProgress(templateId, {
-      event_type: "stage",
-      stage: "auth",
-      message: "Creating scan job...",
-      progress: 5,
-    }).catch(() => {});
-
     const scanJob = await createScanJob({
       purchase_id: purchaseId,
       template_id: templateId,
@@ -149,30 +141,43 @@ syncScanRoute.post(
       started_at: new Date().toISOString(),
     });
 
+    const scanJobId = String(scanJob.id);
+    const publishProgress = (
+      event: Omit<ScanProgressEvent, "timestamp" | "jobId">
+    ) =>
+      publishScanProgress(scanJobId, {
+        ...event,
+        jobId: scanJobId,
+        data: {
+          templateId: String(templateId),
+          ...(event.data ?? {}),
+        },
+      }).catch(() => {});
+
     try {
       await updateScanJob(scanJob.id, { status: "running" });
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "auth",
         message: "Scan job created",
         progress: 10,
       }).catch(() => {});
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "clone",
         message: "Fetching repository...",
         progress: 15,
       }).catch(() => {});
       const repo = await fetchRepoContents(sourceRepo);
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "clone",
         message: "Repository fetched",
         progress: 25,
       }).catch(() => {});
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "semgrep",
         message: "Bundling repository files...",
@@ -202,7 +207,7 @@ syncScanRoute.post(
       await updateScanJob(scanJob.id, { status: "analyzing" });
 
       // Run security tools with progress updates
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "gitleaks",
         message: "Scanning for secrets...",
@@ -210,7 +215,7 @@ syncScanRoute.post(
       }).catch(() => {});
       const secretsFindings = await scanForSecrets(repo.files);
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "trufflehog",
         message: "Analyzing prompt injection risks...",
@@ -218,7 +223,7 @@ syncScanRoute.post(
       }).catch(() => {});
       const promptFindings = await analyzePromptInjection(repo.files);
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "analysis",
         message: "Checking dependencies...",
@@ -226,7 +231,7 @@ syncScanRoute.post(
       }).catch(() => {});
       const depFindings = await analyzeDependencies(repo.files);
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "analysis",
         message: "Analyzing permissions...",
@@ -234,7 +239,7 @@ syncScanRoute.post(
       }).catch(() => {});
       const permFindings = await analyzePermissions(repo.files);
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "semgrep",
         message: "Running static analysis...",
@@ -252,7 +257,7 @@ syncScanRoute.post(
 
       let llmResult;
       try {
-        await publishScanProgress(templateId, {
+        await publishProgress({
           event_type: "stage",
           stage: "analysis",
           message: "Running LLM security analysis...",
@@ -260,7 +265,7 @@ syncScanRoute.post(
         }).catch(() => {});
         llmResult = await analyzeWithLLM(bundle.content);
         allFindings.push(...llmResult.findings);
-        await publishScanProgress(templateId, {
+        await publishProgress({
           event_type: "stage",
           stage: "analysis",
           message: "LLM analysis complete",
@@ -275,7 +280,7 @@ syncScanRoute.post(
             "LLM analysis unavailable; results based on deterministic scanning.",
           recommendations: [] as string[],
         };
-        await publishScanProgress(templateId, {
+        await publishProgress({
           event_type: "stage",
           stage: "analysis",
           message: "LLM analysis unavailable, using deterministic results",
@@ -323,7 +328,7 @@ syncScanRoute.post(
           ? "review_required"
           : "completed";
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "stage",
         stage: "persist",
         message: "Saving results...",
@@ -403,7 +408,7 @@ syncScanRoute.post(
         "Synchronous scan completed"
       );
 
-      await publishScanProgress(templateId, {
+      await publishProgress({
         event_type: "complete",
         stage: "complete",
         message: "Scan complete",

@@ -59,7 +59,7 @@ export async function getRateLimitReset(key) {
         const redis = await getRedisClient();
         const windowKey = `ratelimit:${key}`;
         // Get the oldest entry in the window using zRangeWithScores
-        const results = await redis.zRangeWithScores(windowKey, { start: 0, stop: 0 });
+        const results = await redis.zRangeWithScores(windowKey, 0, 0);
         if (results.length > 0 && results[0]) {
             // Return the time when the oldest request will expire
             return Math.ceil((results[0].score + RATE_LIMIT_WINDOW * 1000 - Date.now()) / 1000);

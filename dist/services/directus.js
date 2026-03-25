@@ -16,66 +16,76 @@ export class DirectusForbiddenError extends Error {
         this.fields = options?.fields;
     }
 }
+let sellerSecurityUpdateForbidden = false;
+let scanJobEventsLedgerUnavailable = false;
+function authHeaders(extra) {
+    const env = getEnv();
+    return {
+        Authorization: `Bearer ${env.DIRECTUS_ADMIN_TOKEN}`,
+        ...extra,
+    };
+}
 export async function directusRequest(path, options = {}) {
     const env = getEnv();
     const url = `${env.DIRECTUS_URL}${path}`;
+    const headers = {
+        ...authHeaders(),
+        ...options.headers,
+    };
+    if (options.body && !(options.body instanceof FormData) && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+    }
     const res = await fetch(url, {
         ...options,
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${env.DIRECTUS_ADMIN_TOKEN}`,
-            ...options.headers,
-        },
+        headers,
     });
     if (!res.ok) {
-        const body = await res.text();
+        const bodyText = await res.text();
         let errorBody = null;
         try {
-            errorBody = JSON.parse(body);
+            errorBody = JSON.parse(bodyText);
         }
         catch {
-            // Body is not JSON, ignore
+            // ignore
         }
+        const errorCode = errorBody?.error?.code || errorBody?.errors?.[0]?.extensions?.code;
+        const errorMessage = errorBody?.error?.message || errorBody?.errors?.[0]?.message || bodyText;
+        const collection = errorBody?.error?.collection || errorBody?.errors?.[0]?.extensions?.collection;
+        const action = errorBody?.error?.action || errorBody?.errors?.[0]?.extensions?.action;
+        const role = errorBody?.error?.role;
         const errorContext = {
             status: res.status,
             path,
             method: options.method || "GET",
-            // Don't log full responseBody - it might contain sensitive data
-            errorCode: errorBody?.error?.code,
-            errorMessage: errorBody?.error?.message,
-            collection: errorBody?.error?.collection,
-            action: errorBody?.error?.action,
-            role: errorBody?.error?.role,
+            errorCode,
+            errorMessage,
+            collection,
+            action,
+            role,
         };
-        // Handle 403 Forbidden with detailed permission error
         if (res.status === 403) {
-            const collection = extractCollectionFromPath(path);
-            const action = extractActionFromMethod(options.method || "GET");
-            logger.error(safeLogContext({ ...errorContext, collection, action }), "Directus 403 Forbidden - Permission denied");
-            throw new DirectusForbiddenError(errorBody?.error?.message || `You do not have permission to ${action} ${collection}`, {
-                collection,
-                action,
-                role: errorBody?.error?.role,
+            const fallbackCollection = extractCollectionFromPath(path);
+            const fallbackAction = extractActionFromMethod(options.method || "GET");
+            logger.error(safeLogContext({ ...errorContext, collection: collection || fallbackCollection, action: action || fallbackAction }), "Directus 403 Forbidden - Permission denied");
+            throw new DirectusForbiddenError(errorMessage || `You do not have permission to ${fallbackAction} ${fallbackCollection}`, {
+                collection: collection || fallbackCollection,
+                action: action || fallbackAction,
+                role,
             });
         }
-        // Handle other errors - redact secrets from context
         logger.error(safeLogContext(errorContext), "Directus request failed");
-        throw new Error(`Directus ${res.status}: ${path} - ${errorBody?.error?.message || body}`);
+        throw new Error(`Directus ${res.status}: ${path} - ${errorMessage}`);
+    }
+    if (res.status === 204) {
+        return {};
     }
     const json = (await res.json());
     return json.data;
 }
-/**
- * Extract collection name from Directus API path
- * e.g., /items/sellers/123 -> sellers
- */
 function extractCollectionFromPath(path) {
     const match = path.match(/^\/items\/([^/]+)/);
     return match?.[1];
 }
-/**
- * Extract action type from HTTP method
- */
 function extractActionFromMethod(method) {
     switch (method.toUpperCase()) {
         case "GET":
@@ -96,8 +106,9 @@ export async function createScanJob(record) {
         method: "POST",
         body: JSON.stringify(record),
     });
-    logger.info({ scanJobId: result.id }, "Scan job created");
-    return result;
+    const id = String(result.id);
+    logger.info({ scanJobId: id }, "Scan job created");
+    return { id };
 }
 export async function updateScanJob(id, patch) {
     await directusRequest(`/items/scan_jobs/${id}`, {
@@ -123,17 +134,36 @@ export async function updateTemplateScanFields(templateId, fields) {
     logger.info({ templateId }, "Template scan fields updated");
 }
 export async function updateSellerSecurityFields(sellerId, fields) {
+    if (sellerSecurityUpdateForbidden) {
+        logger.warn({ sellerId }, "Skipping seller security update (permission previously denied for sellers.update)");
+        return false;
+    }
     const fieldNames = Object.keys(fields);
-    logger.info({ sellerId, fields: fieldNames, fieldValues: fields }, "Updating seller security fields");
+    const normalizedFields = {
+        security_rating: fields.security_rating,
+        security_score: String(fields.security_score),
+        security_color_light: fields.security_color_light,
+        last_security_scan: fields.last_security_scan,
+        scan_compliant: String(fields.scan_compliant),
+    };
+    logger.info({ sellerId, fields: fieldNames, fieldValues: normalizedFields }, "Updating seller security fields");
     try {
-        await directusRequest(`/items/sellers/${sellerId}`, {
+        const sellerRows = await directusRequest(`/items/sellers?filter[user_id][_eq]=${encodeURIComponent(sellerId)}&fields=id&limit=1`);
+        const sellerRecord = sellerRows[0];
+        if (!sellerRecord?.id) {
+            logger.warn({ sellerId }, "Skipping seller security update (no sellers row found for user_id)");
+            return false;
+        }
+        await directusRequest(`/items/sellers/${sellerRecord.id}`, {
             method: "PATCH",
-            body: JSON.stringify(fields),
+            body: JSON.stringify(normalizedFields),
         });
-        logger.info({ sellerId, fields: fieldNames }, "Seller security fields updated");
+        logger.info({ sellerId, sellerRecordId: sellerRecord.id, fields: fieldNames }, "Seller security fields updated");
+        return true;
     }
     catch (error) {
         if (error instanceof DirectusForbiddenError) {
+            sellerSecurityUpdateForbidden = true;
             logger.error({
                 sellerId,
                 fields: fieldNames,
@@ -142,9 +172,7 @@ export async function updateSellerSecurityFields(sellerId, fields) {
                 role: error.role,
                 errorMessage: error.message,
             }, "❌ Permission denied when updating seller security fields");
-            throw new Error(`Permission denied: Cannot update seller fields. Missing permission for ${error.collection}.${error.action}. ` +
-                `Required fields: ${fieldNames.join(", ")}. ` +
-                `Contact admin to grant update permission on sellers collection.`);
+            return false;
         }
         logger.error({ sellerId, fields: fieldNames, error }, "Failed to update seller security fields");
         throw error;
@@ -153,6 +181,42 @@ export async function updateSellerSecurityFields(sellerId, fields) {
 export async function getScanJob(id) {
     return await directusRequest(`/items/scan_jobs/${id}`);
 }
+export async function getScanJobByGitHubRunId(githubRunId) {
+    const query = new URLSearchParams({
+        "filter[github_run_id][_eq]": githubRunId,
+        sort: "-started_at",
+        limit: "1",
+    });
+    const rows = await directusRequest(`/items/scan_jobs?${query.toString()}`).catch(() => []);
+    return rows[0] || null;
+}
+export async function listActiveScanJobsForSeller(sellerId) {
+    const activeStatuses = [
+        "pending",
+        "running",
+        "analyzing",
+        "workflow_seeding",
+        "dispatching",
+        "queued_in_github",
+        "running_in_github",
+        "artifact_processing",
+        "delayed",
+    ].join(",");
+    const query = new URLSearchParams({
+        "filter[seller_id][_eq]": sellerId,
+        "filter[status][_in]": activeStatuses,
+        sort: "-started_at",
+        limit: "20",
+        fields: "id,template_id,seller_id,status,started_at,completed_at,overall_rating,overall_score,github_run_id,artifact_file_id",
+    });
+    try {
+        return await directusRequest(`/items/scan_jobs?${query.toString()}`);
+    }
+    catch (error) {
+        logger.error({ error, sellerId }, "Failed to list active scan jobs for seller");
+        return [];
+    }
+}
 export async function getSellerTemplates(sellerId) {
     try {
         return await directusRequest(`/items/templates?filter[seller_id][_eq]=${sellerId}&fields=id,scan_rating,scan_score`);
@@ -160,5 +224,67 @@ export async function getSellerTemplates(sellerId) {
     catch {
         logger.warn({ sellerId }, "Could not fetch seller templates");
         return [];
+    }
+}
+export async function uploadScanReportPdf(scanJobId, fileName, pdfBuffer) {
+    const env = getEnv();
+    const url = `${env.DIRECTUS_URL}/files`;
+    const formData = new FormData();
+    const blob = new Blob([new Uint8Array(pdfBuffer)], { type: "application/pdf" });
+    formData.append("file", blob, fileName);
+    formData.append("title", `Scan Report ${scanJobId}`);
+    const res = await fetch(url, {
+        method: "POST",
+        headers: authHeaders(),
+        body: formData,
+    });
+    if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`Directus file upload failed (${res.status}): ${body}`);
+    }
+    const json = (await res.json());
+    const fileId = String(json.data?.id || "");
+    if (!fileId) {
+        throw new Error("Directus file upload did not return an id");
+    }
+    return {
+        fileId,
+        assetUrl: `${env.DIRECTUS_URL}/assets/${fileId}`,
+    };
+}
+function isDuplicateEventError(error) {
+    if (!(error instanceof Error))
+        return false;
+    return /RECORD_NOT_UNIQUE|duplicate/i.test(error.message);
+}
+export async function appendScanJobEvent(input) {
+    if (scanJobEventsLedgerUnavailable) {
+        return true;
+    }
+    try {
+        await directusRequest("/items/scan_job_events", {
+            method: "POST",
+            body: JSON.stringify({
+                scan_job_id: input.scanJobId,
+                event_source: input.eventSource,
+                event_type: input.eventType,
+                payload: input.payload || {},
+                provider_event_id: input.providerEventId,
+            }),
+        });
+        return true;
+    }
+    catch (error) {
+        if (isDuplicateEventError(error)) {
+            logger.info({ scanJobId: input.scanJobId, providerEventId: input.providerEventId }, "Duplicate scan_job_events record ignored");
+            return false;
+        }
+        // Missing table/field should not break runtime flow during rollout.
+        if (error instanceof Error && /scan_job_events|field/i.test(error.message)) {
+            scanJobEventsLedgerUnavailable = true;
+            logger.warn({ scanJobId: input.scanJobId, error: error.message }, "Disabling scan_job_events ledger writes for this process (collection missing or forbidden)");
+            return true;
+        }
+        throw error;
     }
 }

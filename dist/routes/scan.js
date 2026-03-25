@@ -3,21 +3,14 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { authMiddleware } from "../middleware/auth.js";
 import { rateLimitMiddleware } from "../middleware/rate-limit.js";
-import { fetchRepoContents, cleanupRepo } from "../services/repo.js";
-import { bundleRepo } from "../services/bundler.js";
-import { analyzeWithLLM } from "../services/llm.js";
-import { scanForSecrets } from "../services/secrets.js";
-import { analyzePromptInjection } from "../analyzers/prompt-injection.js";
-import { analyzeDependencies } from "../analyzers/dependency-check.js";
-import { analyzePermissions } from "../analyzers/permission-scoper.js";
-import { analyzeSast } from "../analyzers/sast.js";
-import { calculateCategoryRating, aggregateRatings } from "../services/rating.js";
-import { createScanJob, updateScanJob, createScanFindings, updateTemplateScanFields, updateSellerSecurityFields, getSellerTemplates, DirectusForbiddenError, } from "../services/directus.js";
+import { appendScanJobEvent, createScanJob, getScanJob, getScanJobByGitHubRunId, listActiveScanJobsForSeller, updateTemplateScanFields, updateScanJob, uploadScanReportPdf, } from "../services/directus.js";
 import { logger } from "../logger.js";
-import { safeLogContext } from "../lib/redact.js";
+import { getScanState, publishScanProgress } from "../services/redis.js";
+import { admitTemplateScan, bindTemplateScanJob, clearTemplateBindingIfMatches, getActiveTemplateIds, releaseTemplateScanSlot, } from "../services/scan-concurrency.js";
+import { cancelScanJob, enqueueScanJob, getScanRunnerStats, isScanJobCancelled, } from "../services/scan-runner.js";
+import { cancelWorkflowRun, dispatchWorkflowRun, downloadScanArtifacts, ensureWorkflowInRepo, findRecentWorkflowRun, GitHubApiError, getPlatformWorkflowContext, getRepoContext, verifyGitHubWebhookSignature, } from "../services/github-actions.js";
+import { getEnv } from "../env.js";
 import { RATING_TO_COLOR } from "../constants.js";
-import { publishScanProgress } from "../services/redis.js";
-// Input length limits to prevent DoS
 const MAX_LENGTH = {
     TEMPLATE_ID: 50,
     SELLER_ID: 100,
@@ -26,307 +19,478 @@ const MAX_LENGTH = {
     BUYER_ID: 100,
     TARGET_REPO: 200,
 };
-// Pre-process templateId to validate length after transformation
-const templateIdSchema = z.union([
-    z.string().max(MAX_LENGTH.TEMPLATE_ID, `templateId must be at most ${MAX_LENGTH.TEMPLATE_ID} characters`),
-    z.number().max(999999999, "templateId too large"),
-]).transform((val) => {
-    const str = String(val);
-    if (typeof val === 'number') {
-        logger.warn(safeLogContext({ originalValue: val, convertedValue: str }), 'templateId type conversion: number -> string');
-    }
-    return str;
-});
 const scanRequestSchema = z.object({
-    templateId: templateIdSchema,
-    sellerId: z.string()
-        .min(1, "sellerId is required")
-        .max(MAX_LENGTH.SELLER_ID, `sellerId must be at most ${MAX_LENGTH.SELLER_ID} characters`),
-    sourceRepo: z.string()
-        .regex(/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/, "sourceRepo must be in format: owner/repo")
-        .max(MAX_LENGTH.SOURCE_REPO, `sourceRepo must be at most ${MAX_LENGTH.SOURCE_REPO} characters`),
-    purchaseId: z.string()
-        .optional()
-        .refine((val) => !val || val.length <= MAX_LENGTH.PURCHASE_ID, {
-        message: `purchaseId must be at most ${MAX_LENGTH.PURCHASE_ID} characters`,
+    templateId: z
+        .union([
+        z.string().max(MAX_LENGTH.TEMPLATE_ID),
+        z.number().int().nonnegative().max(999999999),
+    ])
+        .transform((val) => String(val)),
+    sellerId: z.string().min(1).max(MAX_LENGTH.SELLER_ID),
+    sourceRepo: z
+        .string()
+        .regex(/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/)
+        .max(MAX_LENGTH.SOURCE_REPO),
+    purchaseId: z.string().max(MAX_LENGTH.PURCHASE_ID).optional(),
+    buyerId: z.string().max(MAX_LENGTH.BUYER_ID).optional(),
+    targetRepo: z.string().max(MAX_LENGTH.TARGET_REPO).optional(),
+    githubInstallationId: z.coerce.number().int().positive().optional(),
+});
+const scanCancelSchema = z.object({
+    sellerId: z.string().min(1).max(MAX_LENGTH.SELLER_ID),
+});
+const scanWebhookSchema = z.object({
+    action: z.string().optional(),
+    repository: z
+        .object({
+        full_name: z.string().optional(),
+    })
+        .optional(),
+    workflow_run: z
+        .object({
+        id: z.number(),
+        run_attempt: z.number().optional(),
+        status: z.string().nullable().optional(),
+        conclusion: z.string().nullable().optional(),
+        html_url: z.string().nullable().optional(),
+        event: z.string().nullable().optional(),
+        name: z.string().nullable().optional(),
+    })
+        .optional(),
+});
+const scanResultArtifactSchema = z.object({
+    overallRating: z.enum(["A", "B", "C", "D", "F"]),
+    overallScore: z.number().min(0).max(100),
+    riskLevel: z.enum(["none", "low", "medium", "high", "critical"]),
+    severityCounts: z.object({
+        low: z.number().int().nonnegative(),
+        medium: z.number().int().nonnegative(),
+        high: z.number().int().nonnegative(),
+        critical: z.number().int().nonnegative(),
     }),
-    buyerId: z.string()
-        .optional()
-        .refine((val) => !val || val.length <= MAX_LENGTH.BUYER_ID, {
-        message: `buyerId must be at most ${MAX_LENGTH.BUYER_ID} characters`,
+    categoryRatings: z.object({
+        secrets: z.enum(["A", "B", "C", "D", "F"]),
+        promptInjection: z.enum(["A", "B", "C", "D", "F"]),
+        dependencies: z.enum(["A", "B", "C", "D", "F"]),
+        permissions: z.enum(["A", "B", "C", "D", "F"]),
+        sast: z.enum(["A", "B", "C", "D", "F"]),
     }),
-    targetRepo: z.string()
-        .optional()
-        .refine((val) => !val || val.length <= MAX_LENGTH.TARGET_REPO, {
-        message: `targetRepo must be at most ${MAX_LENGTH.TARGET_REPO} characters`,
-    }),
+    summary: z.string().default(""),
+    recommendations: z.array(z.string()).default([]),
 });
 export const scanRoute = new Hono();
-/**
- * Async scan processing function - runs in background
- */
-async function processScanAsync(jobId, templateId, sellerId, sourceRepo, purchaseId, buyerId, targetRepo) {
-    const startedAt = Date.now();
-    try {
-        logger.info({ jobId, templateId }, "🔍 Async scan processing started");
-        // Update status to processing
-        await updateScanJob(jobId, { status: "running" });
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "auth",
-            message: "Scan job processing started",
-            progress: 10,
-        }).catch(() => { });
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "clone",
-            message: "Fetching repository...",
-            progress: 15,
-        }).catch(() => { });
-        const repo = await fetchRepoContents(sourceRepo);
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "clone",
-            message: "Repository fetched",
-            progress: 25,
-        }).catch(() => { });
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "semgrep",
-            message: "Bundling repository files...",
-            progress: 30,
-        }).catch(() => { });
-        const bundle = await bundleRepo(repo);
-        if (bundle.exceededThreshold) {
-            await updateScanJob(jobId, {
-                status: "review_required",
-                bundled_line_count: bundle.lineCount,
-                exceeded_line_threshold: true,
-                error_message: "Bundled code exceeds line threshold. Manual review required.",
-                completed_at: new Date().toISOString(),
-            });
-            await cleanupRepo(repo.tempDir);
-            await publishScanProgress(templateId, {
-                event_type: "complete",
-                stage: "complete",
-                message: "Scan complete: review_required (exceeded line threshold)",
-                progress: 100,
-                data: { status: "review_required", exceededLineThreshold: true },
-            }).catch(() => { });
-            logger.info({ jobId, templateId }, "✅ Async scan completed (review_required - line threshold)");
-            return;
-        }
-        await updateScanJob(jobId, { status: "analyzing" });
-        // Run security tools with progress updates
-        // First: scan for secrets (sequential - must complete before other analysis)
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "gitleaks",
-            message: "Scanning for secrets...",
-            progress: 45,
-        }).catch(() => { });
-        const secretsFindings = await scanForSecrets(repo.files);
-        // Second: run all analyzers in parallel for 5x speed improvement
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "analysis",
-            message: "Running security analyzers in parallel...",
-            progress: 55,
-        }).catch(() => { });
-        const [promptFindings, depFindings, permFindings, sastFindings] = await Promise.all([
-            analyzePromptInjection(repo.files),
-            analyzeDependencies(repo.files),
-            analyzePermissions(repo.files),
-            analyzeSast(repo.files),
-        ]);
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "analysis",
-            message: "All security analyzers complete",
-            progress: 85,
-        }).catch(() => { });
-        const allFindings = [];
-        allFindings.push(...secretsFindings);
-        allFindings.push(...promptFindings);
-        allFindings.push(...depFindings);
-        allFindings.push(...permFindings);
-        allFindings.push(...sastFindings);
-        let llmResult;
-        try {
-            await publishScanProgress(templateId, {
-                event_type: "stage",
-                stage: "analysis",
-                message: "Running LLM security analysis...",
-                progress: 90,
-            }).catch(() => { });
-            llmResult = await analyzeWithLLM(bundle.content);
-            allFindings.push(...llmResult.findings);
-            await publishScanProgress(templateId, {
-                event_type: "stage",
-                stage: "analysis",
-                message: "LLM analysis complete",
-                progress: 95,
-            }).catch(() => { });
-        }
-        catch (err) {
-            logger.warn({ err, jobId }, "LLM analysis failed, using deterministic results only");
-            llmResult = {
-                findings: [],
-                ratings: {},
-                summary: "LLM analysis unavailable; results based on deterministic scanning.",
-                recommendations: [],
-            };
-            await publishScanProgress(templateId, {
-                event_type: "stage",
-                stage: "analysis",
-                message: "LLM analysis unavailable, using deterministic results",
-                progress: 95,
-            }).catch(() => { });
-        }
-        const categoryMap = {};
-        for (const finding of allFindings) {
-            if (!categoryMap[finding.category])
-                categoryMap[finding.category] = [];
-            categoryMap[finding.category].push(finding);
-        }
-        const categoryRatings = {};
-        for (const [category, catFindings] of Object.entries(categoryMap)) {
-            categoryRatings[category] = calculateCategoryRating(catFindings);
-        }
-        const result = aggregateRatings(categoryRatings);
-        await createScanFindings(allFindings.map((f) => ({
-            scan_job_id: jobId,
-            severity: f.severity,
-            category: f.category,
-            tool: f.tool,
-            rule_id: f.ruleId,
-            file_path: f.filePath,
-            line_start: f.lineStart,
-            line_end: f.lineEnd,
-            title: f.title,
-            description: f.description,
-            recommendation: f.recommendation,
-            evidence: f.evidence,
-            status: "open",
-        })));
-        const completedAt = new Date().toISOString();
-        const isDeployable = result.overallRating === "D" || result.overallRating === "F"
-            ? "review_required"
-            : "completed";
-        await publishScanProgress(templateId, {
-            event_type: "stage",
-            stage: "persist",
-            message: "Saving results...",
-            progress: 95,
-        }).catch(() => { });
-        await updateScanJob(jobId, {
-            status: isDeployable,
-            risk_level: mapRatingToRisk(result.overallRating),
-            overall_rating: result.overallRating,
-            overall_score: result.overallScore,
-            rating_secrets: (categoryRatings.secrets?.rating ?? "A"),
-            rating_prompt_injection: (categoryRatings.prompt_injection?.rating ?? "A"),
-            rating_dependencies: (categoryRatings.dependencies?.rating ?? "A"),
-            rating_permissions: (categoryRatings.permissions?.rating ?? "A"),
-            rating_sast: (categoryRatings.sast?.rating ?? "A"),
-            seller_color_light: result.colorLight,
-            completed_at: completedAt,
-            llm_summary: llmResult.summary,
-            llm_recommendations: { recommendations: llmResult.recommendations },
-            bundled_line_count: bundle.lineCount,
-            exceeded_line_threshold: bundle.exceededThreshold,
-            metadata: {
-                ratings: result.ratings,
-                overall: {
-                    rating: result.overallRating,
-                    score: result.overallScore,
-                    color_light: result.colorLight,
-                    weakest_category: result.weakestCategory,
-                },
-                findings_count: allFindings.length,
-                bundled_line_count: bundle.lineCount,
-                exceeded_line_threshold: bundle.exceededThreshold,
-                duration_ms: Date.now() - startedAt,
-            },
-        });
-        await updateTemplateScanFields(templateId, {
-            scan_rating: result.overallRating,
-            scan_score: result.overallScore,
-            scan_color_light: result.colorLight,
-            last_scan_at: completedAt,
-            last_scan_job_id: jobId,
-            scan_status: isDeployable === "review_required" ? "failed" : "passed",
-        });
-        const sellerTemplates = await getSellerTemplates(sellerId);
-        const worstRating = findWorstRating(sellerTemplates, result.overallRating);
-        try {
-            logger.info({ sellerId, worstRating, score: result.overallScore }, "📝 Updating seller security fields after scan");
-            await updateSellerSecurityFields(sellerId, {
-                security_rating: worstRating,
-                security_score: result.overallScore,
-                security_color_light: RATING_TO_COLOR[worstRating],
-                last_security_scan: completedAt,
-                scan_compliant: worstRating === "A" ||
-                    worstRating === "B" ||
-                    worstRating === "C",
-            });
-            logger.info({ sellerId }, "✅ Seller security fields updated successfully");
-        }
-        catch (error) {
-            if (error instanceof DirectusForbiddenError) {
-                logger.error({
-                    sellerId,
-                    templateId,
-                    jobId,
-                    collection: error.collection,
-                    action: error.action,
-                    role: error.role,
-                    fields: ["security_rating", "security_score", "security_color_light", "last_security_scan", "scan_compliant"],
-                    errorMessage: error.message,
-                }, "❌ 403 Forbidden: Cannot update seller - Missing Directus RBAC permission");
-                // Continue without failing the entire scan - seller update is non-critical
-                logger.warn({ sellerId, templateId }, "⚠️  Scan completed but seller security fields were not updated due to permission error");
-            }
-            else {
-                logger.error({ sellerId, templateId, jobId, error }, "❌ Failed to update seller security fields");
-                throw error;
-            }
-        }
-        await cleanupRepo(repo.tempDir);
-        logger.info({
-            jobId,
-            templateId,
-            overallRating: result.overallRating,
-            findings: allFindings.length,
-            durationMs: Date.now() - startedAt,
-        }, "✅ Async scan completed successfully");
-        await publishScanProgress(templateId, {
-            event_type: "complete",
-            stage: "complete",
-            message: "Scan complete",
-            progress: 100,
-            data: {
-                rating: result.overallRating,
-                score: result.overallScore,
-                status: isDeployable,
-            },
-        }).catch(() => { });
-    }
-    catch (err) {
-        logger.error({ err, jobId, templateId }, "❌ Async scan failed");
-        await updateScanJob(jobId, {
-            status: "failed",
-            error_message: err instanceof Error ? err.message : "Unknown error",
-            completed_at: new Date().toISOString(),
-        });
-        await publishScanProgress(templateId, {
-            event_type: "error",
-            stage: "error",
-            message: `Scan failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-            progress: 0,
-        }).catch(() => { });
+const ACTIVE_SCAN_STATUSES = new Set([
+    "pending",
+    "running",
+    "analyzing",
+    "workflow_seeding",
+    "dispatching",
+    "queued_in_github",
+    "running_in_github",
+    "artifact_processing",
+    "delayed",
+]);
+const TERMINAL_STATUSES = new Set([
+    "completed",
+    "failed",
+    "review_required",
+    "approved",
+    "rejected",
+]);
+function isActiveScanStatus(status) {
+    return ACTIVE_SCAN_STATUSES.has(status);
+}
+function statusToProgress(status) {
+    switch (status) {
+        case "pending":
+            return 5;
+        case "workflow_seeding":
+            return 15;
+        case "dispatching":
+            return 25;
+        case "queued_in_github":
+            return 35;
+        case "running_in_github":
+            return 70;
+        case "artifact_processing":
+            return 90;
+        case "delayed":
+            return 45;
+        case "completed":
+        case "review_required":
+            return 100;
+        case "failed":
+            return 0;
+        default:
+            return 20;
     }
 }
+function stageForStatus(status) {
+    switch (status) {
+        case "workflow_seeding":
+            return "workflow_seeding";
+        case "dispatching":
+            return "dispatching";
+        case "queued_in_github":
+            return "queued_in_github";
+        case "running_in_github":
+            return "running_in_github";
+        case "artifact_processing":
+            return "artifact_processing";
+        case "delayed":
+            return "delayed";
+        case "completed":
+        case "review_required":
+        case "approved":
+        case "rejected":
+            return "complete";
+        case "failed":
+            return "error";
+        default:
+            return "queued";
+    }
+}
+async function publishStatusEvent(jobId, status, message, data) {
+    const eventType = status === "failed"
+        ? "error"
+        : status === "completed" || status === "review_required" || status === "approved" || status === "rejected"
+            ? "complete"
+            : "stage";
+    await publishScanProgress(jobId, {
+        jobId,
+        event_type: eventType,
+        stage: stageForStatus(status),
+        message,
+        progress: statusToProgress(status),
+        data,
+    }).catch(() => { });
+}
+function classifyDispatchError(err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const text = message.toLowerCase();
+    if (err instanceof GitHubApiError) {
+        const path = err.path.toLowerCase();
+        if ((err.status === 403 || err.status === 404) &&
+            path.includes("/contents/.github/workflows/")) {
+            return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
+        }
+        if ((err.status === 401 || err.status === 403) &&
+            path.includes("/actions/workflows/")) {
+            return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
+        }
+    }
+    if (text.includes("cancelled by user") || text.includes("canceled by user")) {
+        return { failureCode: "CANCELED_BY_USER", status: "failed" };
+    }
+    if (text.includes("cannot access repository")) {
+        return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
+    }
+    if (text.includes("github installation missing required permissions for workflow dispatch") ||
+        text.includes("github dispatch forbidden for") ||
+        text.includes("actions=missing") ||
+        text.includes("workflows=missing")) {
+        return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
+    }
+    if (text.includes("rate limit") || text.includes("abuse")) {
+        return { failureCode: "GITHUB_RATE_LIMITED", status: "delayed" };
+    }
+    if (text.includes("workflow") && text.includes("not found")) {
+        return { failureCode: "WORKFLOW_NOT_FOUND", status: "failed" };
+    }
+    if (text.includes("resource not accessible by integration")) {
+        return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
+    }
+    if (text.includes("seed") || text.includes("contents")) {
+        return { failureCode: "WORKFLOW_SEED_FAILED", status: "failed" };
+    }
+    return { failureCode: "DISPATCH_FAILED", status: "failed" };
+}
+function buildDispatchFailureReason(err, classified, workflowFile) {
+    const raw = err instanceof Error ? err.message : String(err);
+    const lower = raw.toLowerCase();
+    if (classified.failureCode === "WORKFLOW_SEED_PERMISSION_DENIED") {
+        const actionsMatch = raw.match(/actions=([a-z_]+)/i);
+        const workflowsMatch = raw.match(/workflows=([a-z_]+)/i);
+        if (actionsMatch || workflowsMatch) {
+            const actions = actionsMatch?.[1] || "missing";
+            const workflows = workflowsMatch?.[1] || "missing";
+            return `GitHub App installation permissions are insufficient for workflow dispatch (actions=${actions}, workflows=${workflows}). Open the app installation for the workflow repository owner, accept updated permissions, and reinstall if required.`;
+        }
+        return "GitHub App cannot access the configured workflow repository/workflow path. Verify owner/repo/ref and reinstall the app with repository access.";
+    }
+    if (classified.failureCode === "WORKFLOW_NOT_FOUND") {
+        return `GitHub workflow "${workflowFile}" was not found in the configured workflow repository/ref.`;
+    }
+    if (classified.failureCode === "GITHUB_RATE_LIMITED") {
+        return "GitHub rate limiting or queue delay detected. Please retry shortly.";
+    }
+    if (lower.includes("forbidden")) {
+        return "GitHub denied this request for the repository/integration. Verify app installation scope and permissions, then retry.";
+    }
+    return raw;
+}
+function throwIfCancelled(jobId) {
+    if (isScanJobCancelled(jobId)) {
+        throw new Error("Scan cancelled by user");
+    }
+}
+function isPlatformWorkflowProvider(provider) {
+    return provider === "github_actions_platform";
+}
+function isPublishableRating(rating) {
+    return rating === "A" || rating === "B";
+}
+function resolveRunRepoFullName(job) {
+    const owner = job.github_repo_owner ? String(job.github_repo_owner).trim() : "";
+    const repo = job.github_repo_name ? String(job.github_repo_name).trim() : "";
+    if (owner && repo) {
+        return `${owner}/${repo}`;
+    }
+    return String(job.source_repo);
+}
+async function failScanJob(job, status, failureCode, failureReason, deliveryId) {
+    const now = new Date().toISOString();
+    const jobId = String(job.id);
+    await updateScanJob(jobId, {
+        status,
+        failure_code: failureCode,
+        failure_reason: failureReason,
+        error_message: failureReason,
+        completed_at: TERMINAL_STATUSES.has(status) ? now : undefined,
+    }).catch((err) => {
+        logger.error({ err, jobId, failureCode }, "Failed to update failed scan job state");
+    });
+    await appendScanJobEvent({
+        scanJobId: jobId,
+        eventSource: "app",
+        eventType: `scan_failed:${failureCode}`,
+        providerEventId: deliveryId,
+        payload: { failureCode, failureReason, status },
+    }).catch(() => { });
+    await publishStatusEvent(jobId, status, failureReason, {
+        templateId: String(job.template_id),
+        failureCode,
+    });
+    if (TERMINAL_STATUSES.has(status)) {
+        await clearTemplateBindingIfMatches(String(job.seller_id), String(job.template_id), jobId).catch(() => { });
+    }
+}
+function getActiveJobTtlMs() {
+    const env = getEnv();
+    const minutes = Number(env.SCAN_ACTIVE_JOB_TTL_MINUTES);
+    const safeMinutes = Number.isFinite(minutes) ? Math.max(5, minutes) : 120;
+    return safeMinutes * 60 * 1000;
+}
+function isStaleActiveJob(job, nowMs, ttlMs) {
+    const startedAtMs = new Date(String(job.started_at || "")).getTime();
+    if (!Number.isFinite(startedAtMs))
+        return true;
+    return nowMs - startedAtMs > ttlMs;
+}
+async function reconcileStaleActiveJobsForSeller(sellerId) {
+    const ttlMs = getActiveJobTtlMs();
+    const ttlMinutes = Math.round(ttlMs / (60 * 1000));
+    const nowMs = Date.now();
+    const activeJobs = await listActiveScanJobsForSeller(sellerId).catch(() => []);
+    const staleJobs = activeJobs.filter((job) => isStaleActiveJob(job, nowMs, ttlMs));
+    for (const job of staleJobs) {
+        const jobId = String(job.id);
+        logger.warn({
+            sellerId,
+            jobId,
+            status: job.status,
+            startedAt: job.started_at,
+            ttlMinutes,
+        }, "Resetting stale active scan job");
+        await failScanJob({
+            id: jobId,
+            seller_id: String(job.seller_id),
+            template_id: String(job.template_id),
+        }, "failed", "STALE_ACTIVE_JOB", `Scan job exceeded ${ttlMinutes} minutes in an active state and was reset. Retry manually.`);
+    }
+    return staleJobs.length;
+}
+async function dispatchGitHubScan(jobId, request) {
+    const startedAtMs = Date.now();
+    const env = getEnv();
+    const usePlatformWorkflow = isPlatformWorkflowProvider(env.SCAN_PROVIDER);
+    await updateScanJob(jobId, { status: "dispatching" });
+    await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
+        templateId: request.templateId,
+    });
+    try {
+        throwIfCancelled(jobId);
+        const sourceRepoContext = await getRepoContext(request.sourceRepo, request.githubInstallationId);
+        const workflowRepoContext = usePlatformWorkflow
+            ? await getPlatformWorkflowContext()
+            : sourceRepoContext;
+        throwIfCancelled(jobId);
+        await updateScanJob(jobId, {
+            github_installation_id: sourceRepoContext.installationId,
+            github_repo_owner: workflowRepoContext.owner,
+            github_repo_name: workflowRepoContext.repo,
+            status: "dispatching",
+            metadata: {
+                sourceRepo: request.sourceRepo,
+                workflowRepo: `${workflowRepoContext.owner}/${workflowRepoContext.repo}`,
+            },
+        });
+        const dispatchInput = {
+            scanJobId: jobId,
+            reportTitle: `Security Audit for ${request.sourceRepo}`,
+            sourceRepo: request.sourceRepo,
+            sourceInstallationId: sourceRepoContext.installationId,
+            templateId: request.templateId,
+            sellerId: request.sellerId,
+        };
+        try {
+            await dispatchWorkflowRun(workflowRepoContext, dispatchInput);
+        }
+        catch (dispatchErr) {
+            const isGitHubApiError = dispatchErr instanceof GitHubApiError;
+            const isMissingWorkflow = isGitHubApiError &&
+                dispatchErr.status === 404 &&
+                dispatchErr.path.includes("/actions/workflows/");
+            const isUnexpectedInput = isGitHubApiError &&
+                dispatchErr.status === 422 &&
+                dispatchErr.responseText.toLowerCase().includes("unexpected inputs");
+            const shouldSeedOrUpdateWorkflow = !usePlatformWorkflow
+                ? isMissingWorkflow
+                : isMissingWorkflow || isUnexpectedInput;
+            if (!shouldSeedOrUpdateWorkflow) {
+                throw dispatchErr;
+            }
+            throwIfCancelled(jobId);
+            await updateScanJob(jobId, { status: "workflow_seeding" });
+            await publishStatusEvent(jobId, "workflow_seeding", usePlatformWorkflow
+                ? "Seeding/updating platform scan workflow..."
+                : "Workflow missing. Seeding workflow in repository...", {
+                templateId: request.templateId,
+                owner: workflowRepoContext.owner,
+                repo: workflowRepoContext.repo,
+            });
+            await ensureWorkflowInRepo(workflowRepoContext, { force: usePlatformWorkflow });
+            throwIfCancelled(jobId);
+            await updateScanJob(jobId, { status: "dispatching" });
+            await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
+                templateId: request.templateId,
+                owner: workflowRepoContext.owner,
+                repo: workflowRepoContext.repo,
+            });
+            await dispatchWorkflowRun(workflowRepoContext, dispatchInput);
+        }
+        throwIfCancelled(jobId);
+        const runLookup = await findRecentWorkflowRun(workflowRepoContext, startedAtMs);
+        throwIfCancelled(jobId);
+        if (!runLookup.runId) {
+            await updateScanJob(jobId, {
+                status: "delayed",
+                failure_code: "GITHUB_RATE_LIMITED",
+                failure_reason: "Workflow dispatched but run not visible yet. Waiting for GitHub sync.",
+            });
+            await appendScanJobEvent({
+                scanJobId: jobId,
+                eventSource: "github_poll",
+                eventType: "dispatch_delayed",
+                payload: {
+                    owner: workflowRepoContext.owner,
+                    repo: workflowRepoContext.repo,
+                },
+            }).catch(() => { });
+            await publishStatusEvent(jobId, "delayed", "GitHub accepted dispatch. Waiting for run to be scheduled...", { templateId: request.templateId });
+            return;
+        }
+        throwIfCancelled(jobId);
+        await updateScanJob(jobId, {
+            status: "queued_in_github",
+            github_run_id: String(runLookup.runId),
+            github_run_attempt: runLookup.runAttempt,
+            github_workflow_id: env.GITHUB_WORKFLOW_FILE,
+            failure_code: undefined,
+            failure_reason: undefined,
+            error_message: undefined,
+        });
+        await appendScanJobEvent({
+            scanJobId: jobId,
+            eventSource: "app",
+            eventType: "dispatch_queued",
+            payload: {
+                githubRunId: runLookup.runId,
+                githubRunAttempt: runLookup.runAttempt,
+            },
+        }).catch(() => { });
+        await publishStatusEvent(jobId, "queued_in_github", "Scan queued in GitHub sandbox VM", {
+            templateId: request.templateId,
+            githubRunId: runLookup.runId,
+        });
+    }
+    catch (err) {
+        const classified = classifyDispatchError(err);
+        const failureReason = buildDispatchFailureReason(err, classified, env.GITHUB_WORKFLOW_FILE);
+        const jobEntity = {
+            id: jobId,
+            seller_id: request.sellerId,
+            template_id: request.templateId,
+        };
+        await failScanJob(jobEntity, classified.status, classified.failureCode, failureReason);
+        logger.error({ err, jobId, sourceRepo: request.sourceRepo, failureCode: classified.failureCode, failureReason }, "GitHub scan dispatch failed");
+    }
+}
+scanRoute.post("/scan/cancel/:jobId", authMiddleware, async (c) => {
+    const jobId = c.req.param("jobId");
+    if (!jobId) {
+        return c.json({ error: { code: "INVALID_JOB_ID", message: "Job ID is required" } }, 400);
+    }
+    const body = await c.req.json().catch(() => null);
+    const parsed = scanCancelSchema.safeParse(body);
+    if (!parsed.success) {
+        return c.json({
+            error: {
+                code: "VALIDATION_ERROR",
+                message: parsed.error.issues.map((i) => i.message).join(", "),
+            },
+        }, 400);
+    }
+    const sellerId = parsed.data.sellerId;
+    const job = await getScanJob(jobId).catch(() => null);
+    if (!job) {
+        return c.json({ error: { code: "JOB_NOT_FOUND", message: "Scan job not found" } }, 404);
+    }
+    if (String(job.seller_id) !== String(sellerId)) {
+        return c.json({ error: { code: "FORBIDDEN", message: "Scan job does not belong to seller" } }, 403);
+    }
+    if (!isActiveScanStatus(String(job.status))) {
+        return c.json({
+            accepted: false,
+            code: "SCAN_ALREADY_TERMINAL",
+            message: "Scan already completed or failed",
+            status: job.status,
+        }, 200);
+    }
+    const cancelState = cancelScanJob(jobId);
+    if (job.github_run_id) {
+        try {
+            const runRepo = resolveRunRepoFullName(job);
+            const explicitInstallationId = runRepo.toLowerCase() === String(job.source_repo).toLowerCase() &&
+                job.github_installation_id
+                ? Number(job.github_installation_id)
+                : undefined;
+            const repoContext = await getRepoContext(runRepo, explicitInstallationId);
+            await cancelWorkflowRun(repoContext, Number(job.github_run_id));
+        }
+        catch (error) {
+            logger.warn({ error, jobId, githubRunId: job.github_run_id }, "Failed to cancel GitHub run; continuing with local cancellation state");
+        }
+    }
+    await failScanJob(job, "failed", "CANCELED_BY_USER", "Scan cancelled by user");
+    return c.json({
+        accepted: true,
+        code: "SCAN_CANCELLED",
+        message: "Scan cancelled",
+        queued: cancelState.wasQueued,
+        running: cancelState.wasRunning,
+    });
+});
 scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
     const body = await c.req.json();
     const parsed = scanRequestSchema.safeParse(body);
@@ -338,116 +502,407 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
             },
         }, 400);
     }
-    const { templateId, sellerId, sourceRepo, purchaseId, buyerId, targetRepo } = parsed.data;
-    // Generate unique job ID
-    const jobId = uuidv4();
-    logger.info({ jobId, templateId, sellerId }, "📡 Scan request received - creating async job");
-    // Create scan job in queued state
-    const scanJob = await createScanJob({
-        purchase_id: purchaseId,
-        template_id: templateId,
-        seller_id: sellerId,
-        buyer_id: buyerId,
-        source_repo: sourceRepo,
-        target_repo: targetRepo,
-        status: "pending",
-        risk_level: "none",
-        overall_rating: "A",
-        overall_score: 100,
-        rating_secrets: "A",
-        rating_prompt_injection: "A",
-        rating_dependencies: "A",
-        rating_permissions: "A",
-        rating_sast: "A",
-        seller_color_light: "green",
-        started_at: new Date().toISOString(),
+    const request = parsed.data;
+    const env = getEnv();
+    const requestId = uuidv4();
+    if (env.SCAN_PROVIDER !== "github_actions" && env.SCAN_PROVIDER !== "github_actions_platform") {
+        return c.json({
+            accepted: false,
+            code: "PROVIDER_NOT_SUPPORTED",
+            message: "Scanner is configured for a non-GitHub provider. Set SCAN_PROVIDER=github_actions_platform or github_actions.",
+        }, 503);
+    }
+    await reconcileStaleActiveJobsForSeller(request.sellerId).catch((err) => {
+        logger.warn({ err, sellerId: request.sellerId }, "Failed to reconcile stale active jobs before scan admission");
     });
-    // Start async processing (don't await)
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    processScanAsync(jobId, templateId, sellerId, sourceRepo, purchaseId, buyerId, targetRepo);
-    // Return 202 Accepted immediately
-    logger.info({ jobId, templateId }, "✅ Scan job queued - returning 202 Accepted");
+    const reservationId = `reserved:${requestId}`;
+    logger.info({ requestId, templateId: request.templateId, sellerId: request.sellerId }, "📡 Scan request received - dispatching GitHub Actions run");
+    let admission = await admitTemplateScan(request.sellerId, request.templateId, reservationId);
+    if (admission.state === "existing") {
+        if (admission.jobId.startsWith("reserved:")) {
+            return c.json({
+                accepted: true,
+                code: "SCAN_ALREADY_RUNNING",
+                status: "pending",
+                message: "Scan for this template is already being queued",
+            }, 202);
+        }
+        const existingJob = await getScanJob(admission.jobId).catch(() => null);
+        if (existingJob && isActiveScanStatus(String(existingJob.status))) {
+            return c.json({
+                accepted: true,
+                code: "SCAN_ALREADY_RUNNING",
+                jobId: String(existingJob.id),
+                status: existingJob.status,
+            }, 200);
+        }
+        await clearTemplateBindingIfMatches(request.sellerId, request.templateId, admission.jobId).catch(() => { });
+        admission = await admitTemplateScan(request.sellerId, request.templateId, reservationId);
+    }
+    if (admission.state === "limit") {
+        const activeJobs = await listActiveScanJobsForSeller(request.sellerId);
+        return c.json({
+            accepted: false,
+            code: "MAX_ACTIVE_SCANS_REACHED",
+            message: "Maximum 3 active template scans per user reached",
+            activeTemplates: admission.templateIds,
+            activeJobs: activeJobs.map((job) => ({
+                jobId: String(job.id),
+                templateId: String(job.template_id),
+                status: job.status,
+                startedAt: job.started_at,
+                githubRunId: job.github_run_id,
+            })),
+        }, 429);
+    }
+    let scanJobId = "";
+    try {
+        const scanJob = await createScanJob({
+            purchase_id: request.purchaseId,
+            template_id: request.templateId,
+            seller_id: request.sellerId,
+            buyer_id: request.buyerId,
+            source_repo: request.sourceRepo,
+            target_repo: request.targetRepo,
+            status: "pending",
+            risk_level: "none",
+            overall_rating: "A",
+            overall_score: 100,
+            rating_secrets: "A",
+            rating_prompt_injection: "A",
+            rating_dependencies: "A",
+            rating_permissions: "A",
+            rating_sast: "A",
+            seller_color_light: "green",
+            started_at: new Date().toISOString(),
+            scan_provider: env.SCAN_PROVIDER === "github_actions_platform"
+                ? "github_actions_platform"
+                : "github_actions",
+            github_installation_id: request.githubInstallationId,
+            github_workflow_id: env.GITHUB_WORKFLOW_FILE,
+            github_repo_owner: request.sourceRepo.split("/")[0],
+            github_repo_name: request.sourceRepo.split("/")[1],
+        });
+        scanJobId = String(scanJob.id);
+        await bindTemplateScanJob(request.sellerId, request.templateId, scanJobId);
+        await appendScanJobEvent({
+            scanJobId,
+            eventSource: "app",
+            eventType: "scan_requested",
+            payload: {
+                templateId: request.templateId,
+                sourceRepo: request.sourceRepo,
+            },
+        }).catch(() => { });
+    }
+    catch (createErr) {
+        await releaseTemplateScanSlot(request.sellerId, request.templateId).catch(() => { });
+        logger.error({ createErr, requestId, sellerId: request.sellerId, templateId: request.templateId }, "Failed to create scan job");
+        return c.json({
+            error: {
+                code: "SCAN_CREATE_FAILED",
+                message: "Failed to create scan job",
+            },
+        }, 500);
+    }
+    const queued = enqueueScanJob(scanJobId, async () => {
+        await dispatchGitHubScan(scanJobId, request);
+    });
+    if (!queued) {
+        const failedJob = {
+            id: scanJobId,
+            seller_id: request.sellerId,
+            template_id: request.templateId,
+        };
+        await failScanJob(failedJob, "failed", "SCANNER_CAPACITY_REACHED", "Scanner queue is currently full. Please retry in a moment.");
+        await clearTemplateBindingIfMatches(request.sellerId, request.templateId, scanJobId).catch(() => { });
+        return c.json({
+            accepted: false,
+            code: "SCANNER_CAPACITY_REACHED",
+            message: "Scanner queue is currently full. Please retry in a moment.",
+            queue: getScanRunnerStats(),
+        }, 503);
+    }
     return c.json({
-        jobId: scanJob.id,
-        status: "queued",
-        pollUrl: `/scan/status/${scanJob.id}`,
+        accepted: true,
+        code: "SCAN_QUEUED",
+        jobId: scanJobId,
+        status: "pending",
+        pollUrl: `/scan/status/${scanJobId}`,
+        streamChannel: `scan:progress:${scanJobId}`,
+        queue: getScanRunnerStats(),
     }, 202);
 });
-/**
- * GET /scan/status/:jobId
- * Poll for scan job status
- */
 scanRoute.get("/scan/status/:jobId", authMiddleware, async (c) => {
     const jobId = c.req.param("jobId");
     if (!jobId) {
         return c.json({ error: { code: "INVALID_JOB_ID", message: "Job ID is required" } }, 400);
     }
     try {
-        const { getScanJob } = await import("../services/directus.js");
         const job = await getScanJob(jobId);
+        const metadata = (job.metadata || {});
+        const reportUrlFromMetadata = typeof metadata.reportUrl === "string" ? metadata.reportUrl : undefined;
         if (!job) {
             return c.json({ error: { code: "JOB_NOT_FOUND", message: "Scan job not found" } }, 404);
         }
-        // Build response based on job status
-        const response = {
-            jobId: job.id,
+        return c.json({
+            jobId: String(job.id),
             status: job.status,
-        };
-        // Add progress based on status
-        if (job.status === "pending") {
-            response.progress = 10;
-        }
-        else if (job.status === "running") {
-            response.progress = 50;
-        }
-        else if (job.status === "analyzing") {
-            response.progress = 75;
-        }
-        else if (job.status === "completed" || job.status === "review_required") {
-            response.progress = 100;
-            response.overallRating = job.overall_rating;
-            response.overallScore = job.overall_score;
-            response.colorLight = job.seller_color_light;
-            response.completedAt = job.completed_at;
-            response.metadata = job.metadata;
-        }
-        else if (job.status === "failed") {
-            response.progress = 0;
-            response.errorMessage = job.error_message;
-            response.completedAt = job.completed_at;
-        }
-        return c.json(response);
+            progress: statusToProgress(String(job.status)),
+            overallRating: job.overall_rating,
+            overallScore: job.overall_score,
+            colorLight: job.seller_color_light,
+            errorMessage: job.error_message,
+            completedAt: job.completed_at,
+            failureCode: job.failure_code,
+            failureReason: job.failure_reason,
+            githubRunId: job.github_run_id,
+            githubRunAttempt: job.github_run_attempt,
+            artifactName: job.artifact_name,
+            artifactFileId: job.artifact_file_id,
+            artifactUrl: reportUrlFromMetadata ||
+                (job.artifact_file_id ? `/assets/${job.artifact_file_id}` : undefined),
+            metadata,
+        });
     }
     catch (err) {
         logger.error({ err, jobId }, "Failed to get scan job status");
-        return c.json({ error: { code: "STATUS_FETCH_FAILED", message: "Failed to fetch job status" } }, 500);
+        return c.json({
+            error: {
+                code: "STATUS_FETCH_FAILED",
+                message: "Failed to fetch job status",
+            },
+        }, 500);
     }
 });
-function mapRatingToRisk(rating) {
-    switch (rating) {
-        case "A":
-            return "none";
-        case "B":
-            return "low";
-        case "C":
-            return "medium";
-        case "D":
-            return "high";
-        case "F":
-            return "critical";
-        default:
-            return "medium";
+scanRoute.get("/scan/active/:sellerId", authMiddleware, async (c) => {
+    const sellerId = c.req.param("sellerId");
+    if (!sellerId) {
+        return c.json({ error: { code: "INVALID_SELLER_ID", message: "sellerId is required" } }, 400);
     }
-}
-function findWorstRating(templates, currentRating) {
-    const order = ["A", "B", "C", "D", "F"];
-    let worst = order.indexOf(currentRating);
-    for (const t of templates) {
-        if (t.scan_rating) {
-            const idx = order.indexOf(t.scan_rating);
-            if (idx > worst)
-                worst = idx;
+    try {
+        await reconcileStaleActiveJobsForSeller(sellerId).catch((err) => {
+            logger.warn({ err, sellerId }, "Failed to reconcile stale active jobs");
+        });
+        const jobs = await listActiveScanJobsForSeller(sellerId);
+        const activeTemplateIds = await getActiveTemplateIds(sellerId);
+        const withState = await Promise.all(jobs.map(async (job) => ({
+            jobId: String(job.id),
+            templateId: String(job.template_id),
+            status: job.status,
+            startedAt: job.started_at,
+            githubRunId: job.github_run_id,
+            latestEvent: await getScanState(String(job.id)),
+        })));
+        return c.json({
+            success: true,
+            sellerId,
+            activeTemplateIds,
+            activeJobs: withState,
+        });
+    }
+    catch (err) {
+        logger.error({ err, sellerId }, "Failed to list active scan jobs");
+        return c.json({
+            error: {
+                code: "ACTIVE_SCAN_FETCH_FAILED",
+                message: "Failed to fetch active scans",
+            },
+        }, 500);
+    }
+});
+scanRoute.post("/github-webhook", async (c) => {
+    const signature = c.req.header("X-Hub-Signature-256") || null;
+    const deliveryId = c.req.header("X-GitHub-Delivery") || undefined;
+    const eventName = c.req.header("X-GitHub-Event") || "";
+    const rawBody = await c.req.text();
+    if (!verifyGitHubWebhookSignature(rawBody, signature)) {
+        return c.json({
+            error: {
+                code: "WEBHOOK_SIGNATURE_INVALID",
+                message: "Invalid webhook signature",
+            },
+        }, 401);
+    }
+    if (eventName !== "workflow_run") {
+        return c.json({ success: true, ignored: true });
+    }
+    const parsedBody = (() => {
+        try {
+            return JSON.parse(rawBody || "{}");
         }
+        catch {
+            return null;
+        }
+    })();
+    const parsed = scanWebhookSchema.safeParse(parsedBody);
+    if (!parsed.success || !parsed.data.workflow_run?.id) {
+        return c.json({
+            error: {
+                code: "PROVIDER_EVENT_INVALID",
+                message: "Invalid workflow_run webhook payload",
+            },
+        }, 400);
     }
-    return (order[worst] ?? "F");
-}
+    const payload = parsed.data;
+    const workflowRun = payload.workflow_run;
+    if (!workflowRun) {
+        return c.json({
+            error: {
+                code: "PROVIDER_EVENT_INVALID",
+                message: "Missing workflow_run payload",
+            },
+        }, 400);
+    }
+    const githubRunId = String(workflowRun.id);
+    const job = await getScanJobByGitHubRunId(githubRunId).catch(() => null);
+    if (!job) {
+        logger.info({ githubRunId, deliveryId, eventName }, "No matching scan job found for webhook run id");
+        return c.json({ success: true, ignored: true, reason: "job_not_found" });
+    }
+    const inserted = await appendScanJobEvent({
+        scanJobId: String(job.id),
+        eventSource: "github_webhook",
+        eventType: `workflow_run:${payload.action || "unknown"}`,
+        payload: {
+            action: payload.action,
+            runStatus: workflowRun.status,
+            runConclusion: workflowRun.conclusion,
+            runAttempt: workflowRun.run_attempt,
+            htmlUrl: workflowRun.html_url,
+        },
+        providerEventId: deliveryId,
+    }).catch(() => true);
+    if (!inserted) {
+        return c.json({ success: true, duplicate: true });
+    }
+    const runStatus = (workflowRun.status || "").toLowerCase();
+    const runConclusion = (workflowRun.conclusion || "").toLowerCase();
+    if (runStatus === "queued" || payload.action === "requested") {
+        await updateScanJob(String(job.id), {
+            status: "queued_in_github",
+            github_run_attempt: workflowRun.run_attempt,
+        });
+        await publishStatusEvent(String(job.id), "queued_in_github", "Scan queued in GitHub Actions", {
+            templateId: String(job.template_id),
+            githubRunId,
+        });
+        return c.json({ success: true, status: "queued_in_github" });
+    }
+    if (runStatus === "in_progress") {
+        await updateScanJob(String(job.id), {
+            status: "running_in_github",
+            github_run_attempt: workflowRun.run_attempt,
+        });
+        await publishStatusEvent(String(job.id), "running_in_github", "Running security scan in GitHub sandbox VM...", {
+            templateId: String(job.template_id),
+            githubRunId,
+        });
+        return c.json({ success: true, status: "running_in_github" });
+    }
+    if (runStatus !== "completed" && payload.action !== "completed") {
+        return c.json({ success: true, ignored: true, status: runStatus });
+    }
+    if (runConclusion !== "success") {
+        await failScanJob(job, "failed", "DISPATCH_FAILED", `GitHub workflow completed with conclusion: ${runConclusion || "unknown"}`, deliveryId);
+        return c.json({ success: true, status: "failed" });
+    }
+    await updateScanJob(String(job.id), {
+        status: "artifact_processing",
+        github_run_attempt: workflowRun.run_attempt,
+    });
+    await publishStatusEvent(String(job.id), "artifact_processing", "Processing report artifact from GitHub...", {
+        templateId: String(job.template_id),
+        githubRunId,
+    });
+    try {
+        const runRepo = resolveRunRepoFullName(job);
+        const explicitInstallationId = runRepo.toLowerCase() === String(job.source_repo).toLowerCase() &&
+            job.github_installation_id
+            ? Number(job.github_installation_id)
+            : undefined;
+        const repoContext = await getRepoContext(runRepo, explicitInstallationId);
+        const artifacts = await downloadScanArtifacts(repoContext, Number(githubRunId));
+        if (!artifacts.pdfBuffer || !artifacts.resultJson) {
+            await failScanJob(job, "failed", "ARTIFACT_NOT_FOUND", "GitHub run completed but required artifacts (report.pdf and scan-result.json) were not found.", deliveryId);
+            return c.json({ success: true, status: "failed", code: "ARTIFACT_NOT_FOUND" });
+        }
+        const parsedResult = (() => {
+            try {
+                const parsed = JSON.parse(artifacts.resultJson || "{}");
+                return scanResultArtifactSchema.parse(parsed);
+            }
+            catch {
+                return null;
+            }
+        })();
+        if (!parsedResult) {
+            await failScanJob(job, "failed", "RESULT_PARSE_FAILED", "scan-result.json is missing required fields or has invalid format.", deliveryId);
+            return c.json({ success: true, status: "failed", code: "RESULT_PARSE_FAILED" });
+        }
+        const overallRating = parsedResult.overallRating;
+        const finalStatus = isPublishableRating(overallRating)
+            ? "completed"
+            : "review_required";
+        const templateScanStatus = isPublishableRating(overallRating) ? "clean" : "review_required";
+        const completedAt = new Date().toISOString();
+        const reportFileName = `security-report-${job.id}.pdf`;
+        const uploaded = await uploadScanReportPdf(String(job.id), reportFileName, artifacts.pdfBuffer);
+        await updateScanJob(String(job.id), {
+            status: finalStatus,
+            completed_at: completedAt,
+            risk_level: parsedResult.riskLevel,
+            overall_rating: overallRating,
+            overall_score: Math.round(parsedResult.overallScore),
+            rating_secrets: parsedResult.categoryRatings.secrets,
+            rating_prompt_injection: parsedResult.categoryRatings.promptInjection,
+            rating_dependencies: parsedResult.categoryRatings.dependencies,
+            rating_permissions: parsedResult.categoryRatings.permissions,
+            rating_sast: parsedResult.categoryRatings.sast,
+            seller_color_light: RATING_TO_COLOR[overallRating],
+            llm_summary: parsedResult.summary,
+            llm_recommendations: parsedResult.recommendations,
+            artifact_name: artifacts.reportArtifactName || undefined,
+            artifact_file_id: uploaded.fileId,
+            artifact_url_github: workflowRun.html_url || undefined,
+            failure_code: undefined,
+            failure_reason: undefined,
+            error_message: undefined,
+            metadata: {
+                ...(job.metadata || {}),
+                reportUrl: uploaded.assetUrl,
+                githubRunId,
+                severityCounts: parsedResult.severityCounts,
+                scanResultArtifactName: artifacts.resultArtifactName,
+            },
+        });
+        await updateTemplateScanFields(String(job.template_id), {
+            scan_rating: overallRating,
+            scan_score: Math.round(parsedResult.overallScore),
+            scan_color_light: RATING_TO_COLOR[overallRating],
+            last_scan_at: completedAt,
+            last_scan_job_id: String(job.id),
+            scan_status: templateScanStatus,
+        });
+        await publishStatusEvent(String(job.id), finalStatus, "Scan complete. Report ready.", {
+            templateId: String(job.template_id),
+            status: finalStatus,
+            rating: overallRating,
+            score: Math.round(parsedResult.overallScore),
+            reportUrl: uploaded.assetUrl,
+            artifactFileId: uploaded.fileId,
+            githubRunId,
+        });
+        await clearTemplateBindingIfMatches(String(job.seller_id), String(job.template_id), String(job.id)).catch(() => { });
+        return c.json({
+            success: true,
+            status: finalStatus,
+            artifactFileId: uploaded.fileId,
+        });
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await failScanJob(job, "failed", "ARTIFACT_DOWNLOAD_FAILED", message, deliveryId);
+        return c.json({ success: true, status: "failed", code: "ARTIFACT_DOWNLOAD_FAILED" });
+    }
+});

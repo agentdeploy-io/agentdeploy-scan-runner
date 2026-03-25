@@ -95,9 +95,11 @@ export async function fetchRepoContents(sourceRepo) {
         .update(Date.now().toString())
         .digest("hex")
         .slice(0, 12);
-    const tempDir = join(tmpdir(), `scan-${hash}`);
+    const workspaceRoot = env.SCAN_WORKDIR || tmpdir();
+    await mkdir(workspaceRoot, { recursive: true });
+    const tempDir = join(workspaceRoot, `scan-${hash}`);
     await mkdir(tempDir, { recursive: true });
-    logger.info({ sourceRepo, tempDir }, "Fetching repository");
+    logger.info({ sourceRepo, tempDir, workspaceRoot }, "Fetching repository");
     const token = await getCachedInstallationToken(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY, owner);
     const tarUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/main`;
     const res = await fetch(tarUrl, {
