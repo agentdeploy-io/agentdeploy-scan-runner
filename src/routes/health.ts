@@ -5,6 +5,7 @@ import { getRedisClient } from "../services/redis.js";
 import { getScanRunnerStats } from "../services/scan-runner.js";
 import { directusRequest } from "../services/directus.js";
 import { logger } from "../logger.js";
+import { getPlatformWorkflowConfigSyncState } from "../services/github-actions.js";
 
 export const healthRoute = new Hono();
 
@@ -67,6 +68,16 @@ healthRoute.get("/health", async (c) => {
     healthy = false;
   }
 
+  const workflowConfigSync = getPlatformWorkflowConfigSyncState();
+  if (getEnv().SCAN_PROVIDER === "github_actions_platform") {
+    checks.workflow_config_sync = workflowConfigSync.status === "ok" ? "ok" : "error";
+    if (workflowConfigSync.status !== "ok") {
+      healthy = false;
+    }
+  } else {
+    checks.workflow_config_sync = "ok";
+  }
+
   return c.json(
     {
       status: healthy ? "healthy" : "unhealthy",
@@ -74,6 +85,18 @@ healthRoute.get("/health", async (c) => {
       checks,
       scanRunner: getScanRunnerStats(),
       provider: getEnv().SCAN_PROVIDER,
+      workflowConfig: {
+        status: workflowConfigSync.status,
+        code: workflowConfigSync.code,
+        message: workflowConfigSync.message,
+        owner: workflowConfigSync.workflowRepo.owner,
+        repo: workflowConfigSync.workflowRepo.repo,
+        ref: workflowConfigSync.workflowRepo.ref,
+        checkedAt: workflowConfigSync.checkedAt,
+        lastSyncAt: workflowConfigSync.lastSyncAt,
+        syncedSecrets: workflowConfigSync.syncedSecrets,
+        syncedVariables: workflowConfigSync.syncedVariables,
+      },
     },
     healthy ? 200 : 503
   );

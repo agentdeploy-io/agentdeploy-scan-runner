@@ -152,7 +152,7 @@ syncScanRoute.post(
           templateId: String(templateId),
           ...(event.data ?? {}),
         },
-      }).catch(() => {});
+      }).catch((err) => logger.warn({ err, scanJobId }, "Failed to publish scan progress"));
 
     try {
       await updateScanJob(scanJob.id, { status: "running" });
@@ -161,28 +161,28 @@ syncScanRoute.post(
         stage: "auth",
         message: "Scan job created",
         progress: 10,
-      }).catch(() => {});
+      });
 
       await publishProgress({
         event_type: "stage",
         stage: "clone",
         message: "Fetching repository...",
         progress: 15,
-      }).catch(() => {});
+      });
       const repo = await fetchRepoContents(sourceRepo);
       await publishProgress({
         event_type: "stage",
         stage: "clone",
         message: "Repository fetched",
         progress: 25,
-      }).catch(() => {});
+      });
 
       await publishProgress({
         event_type: "stage",
         stage: "semgrep",
         message: "Bundling repository files...",
         progress: 30,
-      }).catch(() => {});
+      });
       const bundle = await bundleRepo(repo);
 
       if (bundle.exceededThreshold) {
@@ -212,7 +212,7 @@ syncScanRoute.post(
         stage: "gitleaks",
         message: "Scanning for secrets...",
         progress: 45,
-      }).catch(() => {});
+      });
       const secretsFindings = await scanForSecrets(repo.files);
 
       await publishProgress({
@@ -220,7 +220,7 @@ syncScanRoute.post(
         stage: "trufflehog",
         message: "Analyzing prompt injection risks...",
         progress: 55,
-      }).catch(() => {});
+      });
       const promptFindings = await analyzePromptInjection(repo.files);
 
       await publishProgress({
@@ -228,7 +228,7 @@ syncScanRoute.post(
         stage: "analysis",
         message: "Checking dependencies...",
         progress: 65,
-      }).catch(() => {});
+      });
       const depFindings = await analyzeDependencies(repo.files);
 
       await publishProgress({
@@ -236,7 +236,7 @@ syncScanRoute.post(
         stage: "analysis",
         message: "Analyzing permissions...",
         progress: 75,
-      }).catch(() => {});
+      });
       const permFindings = await analyzePermissions(repo.files);
 
       await publishProgress({
@@ -244,7 +244,7 @@ syncScanRoute.post(
         stage: "semgrep",
         message: "Running static analysis...",
         progress: 85,
-      }).catch(() => {});
+      });
       const sastFindings = await analyzeSast(repo.files);
 
       const allFindings: ScanFinding[] = [];
@@ -262,7 +262,7 @@ syncScanRoute.post(
           stage: "analysis",
           message: "Running LLM security analysis...",
           progress: 90,
-        }).catch(() => {});
+        });
         llmResult = await analyzeWithLLM(bundle.content);
         allFindings.push(...llmResult.findings);
         await publishProgress({
@@ -270,7 +270,7 @@ syncScanRoute.post(
           stage: "analysis",
           message: "LLM analysis complete",
           progress: 95,
-        }).catch(() => {});
+        });
       } catch (err) {
         logger.warn({ err }, "LLM analysis failed, using deterministic results only");
         llmResult = {
@@ -285,7 +285,7 @@ syncScanRoute.post(
           stage: "analysis",
           message: "LLM analysis unavailable, using deterministic results",
           progress: 95,
-        }).catch(() => {});
+        });
       }
 
       const categoryMap: Record<string, ScanFinding[]> = {};
@@ -333,7 +333,7 @@ syncScanRoute.post(
         stage: "persist",
         message: "Saving results...",
         progress: 95,
-      }).catch(() => {});
+      });
 
       await updateScanJob(scanJob.id, {
         status: isDeployable,
@@ -418,7 +418,7 @@ syncScanRoute.post(
           score: result.overallScore,
           status: isDeployable,
         },
-      }).catch(() => {});
+      });
 
       return c.json({
         scanJobId: scanJob.id,

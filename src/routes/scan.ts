@@ -36,7 +36,10 @@ import {
   downloadScanArtifacts,
   ensureWorkflowInRepo,
   findRecentWorkflowRun,
+  getWorkflowRun,
   GitHubApiError,
+  getPlatformWorkflowConfigSyncState,
+  isPlatformWorkflowConfigSyncReady,
   getPlatformWorkflowContext,
   getRepoContext,
   verifyGitHubWebhookSignature,
@@ -215,7 +218,7 @@ async function publishStatusEvent(
     message,
     progress: statusToProgress(status),
     data,
-  }).catch(() => {});
+  }).catch((err) => logger.warn({ err, jobId }, "Failed to publish status event"));
 }
 
 function classifyDispatchError(err: unknown): {
@@ -224,6 +227,13 @@ function classifyDispatchError(err: unknown): {
 } {
   const message = err instanceof Error ? err.message : String(err);
   const text = message.toLowerCase();
+
+  if (text.includes("workflow_config_invalid")) {
+    return { failureCode: "WORKFLOW_CONFIG_INVALID", status: "failed" };
+  }
+  if (text.includes("workflow_secret_sync_failed")) {
+    return { failureCode: "WORKFLOW_SECRET_SYNC_FAILED", status: "failed" };
+  }
 
   if (err instanceof GitHubApiError) {
     const path = err.path.toLowerCase();
@@ -294,6 +304,14 @@ function buildDispatchFailureReason(
     return `GitHub workflow "${workflowFile}" was not found in the configured workflow repository/ref.`;
   }
 
+  if (classified.failureCode === "WORKFLOW_CONFIG_INVALID") {
+    return "Scanner is missing required platform workflow runtime configuration (CHUTES_API_KEY, CHUTES_BASE_URL, CHUTES_MODEL, GITHUB_APP_ID, or GITHUB_APP_PRIVATE_KEY).";
+  }
+
+  if (classified.failureCode === "WORKFLOW_SECRET_SYNC_FAILED") {
+    return "Scanner failed to sync required GitHub Actions secrets/variables into the platform workflow repository.";
+  }
+
   if (classified.failureCode === "GITHUB_RATE_LIMITED") {
     return "GitHub rate limiting or queue delay detected. Please retry shortly.";
   }
@@ -328,6 +346,236 @@ function resolveRunRepoFullName(job: ScanJobEntity): string {
   return String(job.source_repo);
 }
 
+async function finalizeSuccessfulGitHubRun(
+  job: ScanJobEntity,
+  githubRunId: string,
+  githubRunAttempt?: number,
+  workflowHtmlUrl?: string,
+  providerEventId?: string
+): Promise<{ status: ExtendedScanStatus; code?: string; artifactFileId?: string }> {
+  const latest = await getScanJob(String(job.id)).catch(() => job);
+  if (TERMINAL_STATUSES.has(String(latest.status) as ExtendedScanStatus)) {
+    return { status: String(latest.status) as ExtendedScanStatus };
+  }
+
+  await updateScanJob(String(job.id), {
+    status: "artifact_processing",
+    github_run_attempt: githubRunAttempt,
+  });
+
+  await publishStatusEvent(
+    String(job.id),
+    "artifact_processing",
+    "Processing report artifact from GitHub...",
+    {
+      templateId: String(job.template_id),
+      githubRunId,
+    }
+  );
+
+  try {
+    const runRepo = resolveRunRepoFullName(job);
+    const explicitInstallationId =
+      runRepo.toLowerCase() === String(job.source_repo).toLowerCase() &&
+      job.github_installation_id
+        ? Number(job.github_installation_id)
+        : undefined;
+    const repoContext = await getRepoContext(runRepo, explicitInstallationId);
+
+    const artifacts = await downloadScanArtifacts(repoContext, Number(githubRunId));
+    if (!artifacts.pdfBuffer || !artifacts.resultJson) {
+      await failScanJob(
+        job,
+        "failed",
+        "ARTIFACT_NOT_FOUND",
+        "GitHub run completed but required artifacts (report.pdf and scan-result.json) were not found.",
+        providerEventId
+      );
+      return { status: "failed", code: "ARTIFACT_NOT_FOUND" };
+    }
+
+    const parsedResult = (() => {
+      try {
+        const parsed = JSON.parse(artifacts.resultJson || "{}");
+        return scanResultArtifactSchema.parse(parsed);
+      } catch {
+        return null;
+      }
+    })();
+
+    if (!parsedResult) {
+      await failScanJob(
+        job,
+        "failed",
+        "RESULT_PARSE_FAILED",
+        "scan-result.json is missing required fields or has invalid format.",
+        providerEventId
+      );
+      return { status: "failed", code: "RESULT_PARSE_FAILED" };
+    }
+
+    const overallRating = parsedResult.overallRating as ScanRating;
+    const finalStatus: ExtendedScanStatus = isPublishableRating(overallRating)
+      ? "completed"
+      : "review_required";
+    const templateScanStatus = isPublishableRating(overallRating) ? "clean" : "review_required";
+    const completedAt = new Date().toISOString();
+    const reportFileName = `security-report-${job.id}.pdf`;
+    const uploaded = await uploadScanReportPdf(String(job.id), reportFileName, artifacts.pdfBuffer);
+
+    await updateScanJob(String(job.id), {
+      status: finalStatus,
+      completed_at: completedAt,
+      risk_level: parsedResult.riskLevel,
+      overall_rating: overallRating,
+      overall_score: Math.round(parsedResult.overallScore),
+      rating_secrets: parsedResult.categoryRatings.secrets,
+      rating_prompt_injection: parsedResult.categoryRatings.promptInjection,
+      rating_dependencies: parsedResult.categoryRatings.dependencies,
+      rating_permissions: parsedResult.categoryRatings.permissions,
+      rating_sast: parsedResult.categoryRatings.sast,
+      seller_color_light: RATING_TO_COLOR[overallRating],
+      llm_summary: parsedResult.summary,
+      llm_recommendations: parsedResult.recommendations as unknown,
+      artifact_name: artifacts.reportArtifactName || undefined,
+      artifact_file_id: uploaded.fileId,
+      artifact_url_github: workflowHtmlUrl || undefined,
+      failure_code: undefined,
+      failure_reason: undefined,
+      error_message: undefined,
+      metadata: {
+        ...(job.metadata || {}),
+        reportUrl: uploaded.assetUrl,
+        githubRunId,
+        severityCounts: parsedResult.severityCounts,
+        scanResultArtifactName: artifacts.resultArtifactName,
+      },
+    });
+
+    await updateTemplateScanFields(String(job.template_id), {
+      scan_rating: overallRating,
+      scan_score: Math.round(parsedResult.overallScore),
+      scan_color_light: RATING_TO_COLOR[overallRating],
+      last_scan_at: completedAt,
+      last_scan_job_id: String(job.id),
+      scan_status: templateScanStatus,
+    });
+
+    await publishStatusEvent(String(job.id), finalStatus, "Scan complete. Report ready.", {
+      templateId: String(job.template_id),
+      status: finalStatus,
+      rating: overallRating,
+      score: Math.round(parsedResult.overallScore),
+      reportUrl: uploaded.assetUrl,
+      artifactFileId: uploaded.fileId,
+      githubRunId,
+    });
+
+    await clearTemplateBindingIfMatches(
+      String(job.seller_id),
+      String(job.template_id),
+      String(job.id)
+    ).catch((err) => logger.warn({ err, jobId: job.id }, "Failed to clear template binding"));
+
+    return {
+      status: finalStatus,
+      artifactFileId: uploaded.fileId,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await failScanJob(
+      job,
+      "failed",
+      "ARTIFACT_DOWNLOAD_FAILED",
+      message,
+      providerEventId
+    );
+    return { status: "failed", code: "ARTIFACT_DOWNLOAD_FAILED" };
+  }
+}
+
+async function reconcileJobStateFromGitHub(job: ScanJobEntity): Promise<void> {
+  if (!job.github_run_id) return;
+  const jobStatus = String(job.status);
+  if (!isActiveScanStatus(jobStatus)) return;
+
+  try {
+    const runRepo = resolveRunRepoFullName(job);
+    const explicitInstallationId =
+      runRepo.toLowerCase() === String(job.source_repo).toLowerCase() &&
+      job.github_installation_id
+        ? Number(job.github_installation_id)
+        : undefined;
+    const repoContext = await getRepoContext(runRepo, explicitInstallationId);
+    const run = await getWorkflowRun(repoContext, Number(job.github_run_id));
+    const runStatus = String(run.status || "").toLowerCase();
+    const runConclusion = String(run.conclusion || "").toLowerCase();
+
+    if (runStatus === "queued" && jobStatus !== "queued_in_github") {
+      await updateScanJob(String(job.id), {
+        status: "queued_in_github",
+        github_run_attempt: run.runAttempt,
+      });
+      await publishStatusEvent(
+        String(job.id),
+        "queued_in_github",
+        "Scan queued in GitHub Actions",
+        {
+          templateId: String(job.template_id),
+          githubRunId: String(job.github_run_id),
+        }
+      );
+      return;
+    }
+
+    if (runStatus === "in_progress" && jobStatus !== "running_in_github") {
+      await updateScanJob(String(job.id), {
+        status: "running_in_github",
+        github_run_attempt: run.runAttempt,
+      });
+      await publishStatusEvent(
+        String(job.id),
+        "running_in_github",
+        "Running security scan in GitHub sandbox VM...",
+        {
+          templateId: String(job.template_id),
+          githubRunId: String(job.github_run_id),
+        }
+      );
+      return;
+    }
+
+    if (runStatus !== "completed") {
+      return;
+    }
+
+    if (runConclusion !== "success") {
+      await failScanJob(
+        job,
+        "failed",
+        "WORKFLOW_RUN_FAILED",
+        `GitHub workflow completed with conclusion: ${runConclusion || "unknown"}`
+      );
+      return;
+    }
+
+    await finalizeSuccessfulGitHubRun(
+      job,
+      String(job.github_run_id),
+      run.runAttempt
+    );
+  } catch (err) {
+    logger.warn(
+      {
+        err,
+        jobId: String(job.id),
+        githubRunId: String(job.github_run_id),
+      },
+      "Failed to reconcile scan job state from GitHub run"
+    );
+  }
+}
+
 async function failScanJob(
   job: Pick<ScanJobEntity, "id" | "seller_id" | "template_id">,
   status: ExtendedScanStatus,
@@ -354,7 +602,7 @@ async function failScanJob(
     eventType: `scan_failed:${failureCode}`,
     providerEventId: deliveryId,
     payload: { failureCode, failureReason, status },
-  }).catch(() => {});
+  }).catch((err) => logger.warn({ err, jobId }, "Failed to append scan job event"));
 
   await publishStatusEvent(jobId, status, failureReason, {
     templateId: String(job.template_id),
@@ -366,7 +614,7 @@ async function failScanJob(
       String(job.seller_id),
       String(job.template_id),
       jobId
-    ).catch(() => {});
+    ).catch((err) => logger.warn({ err, jobId }, "Failed to clear template binding on failure"));
   }
 }
 
@@ -424,6 +672,15 @@ async function dispatchGitHubScan(
   const startedAtMs = Date.now();
   const env = getEnv();
   const usePlatformWorkflow = isPlatformWorkflowProvider(env.SCAN_PROVIDER);
+
+  if (usePlatformWorkflow && !isPlatformWorkflowConfigSyncReady()) {
+    const syncState = getPlatformWorkflowConfigSyncState();
+    const code =
+      syncState.code === "WORKFLOW_CONFIG_INVALID"
+        ? "WORKFLOW_CONFIG_INVALID"
+        : "WORKFLOW_SECRET_SYNC_FAILED";
+    throw new Error(`${code}: ${syncState.message || "Platform workflow config sync is not ready"}`);
+  }
 
   await updateScanJob(jobId, { status: "dispatching" });
   await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
@@ -524,7 +781,7 @@ async function dispatchGitHubScan(
           owner: workflowRepoContext.owner,
           repo: workflowRepoContext.repo,
         },
-      }).catch(() => {});
+      }).catch((err) => logger.warn({ err, jobId }, "Failed to append dispatch delayed event"));
 
       await publishStatusEvent(
         jobId,
@@ -554,7 +811,7 @@ async function dispatchGitHubScan(
         githubRunId: runLookup.runId,
         githubRunAttempt: runLookup.runAttempt,
       },
-    }).catch(() => {});
+    }).catch((err) => logger.warn({ err, jobId }, "Failed to append dispatch queued event"));
 
     await publishStatusEvent(jobId, "queued_in_github", "Scan queued in GitHub sandbox VM", {
       templateId: request.templateId,
@@ -704,6 +961,27 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
     );
   }
 
+  if (env.SCAN_PROVIDER === "github_actions_platform") {
+    const workflowConfigSync = getPlatformWorkflowConfigSyncState();
+    if (workflowConfigSync.status !== "ok") {
+      const code =
+        workflowConfigSync.code === "WORKFLOW_CONFIG_INVALID"
+          ? "WORKFLOW_CONFIG_INVALID"
+          : "WORKFLOW_SECRET_SYNC_FAILED";
+      return c.json(
+        {
+          accepted: false,
+          code,
+          message:
+            workflowConfigSync.message ||
+            "Platform workflow runtime config is not ready. Startup sync must pass before scans can be dispatched.",
+          workflowConfig: workflowConfigSync,
+        },
+        503
+      );
+    }
+  }
+
   await reconcileStaleActiveJobsForSeller(request.sellerId).catch((err) => {
     logger.warn({ err, sellerId: request.sellerId }, "Failed to reconcile stale active jobs before scan admission");
   });
@@ -751,7 +1029,7 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
       request.sellerId,
       request.templateId,
       admission.jobId
-    ).catch(() => {});
+    ).catch((err) => logger.warn({ err, templateId: request.templateId }, "Failed to clear stale binding"));
 
     admission = await admitTemplateScan(
       request.sellerId,
@@ -821,9 +1099,9 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
         templateId: request.templateId,
         sourceRepo: request.sourceRepo,
       },
-    }).catch(() => {});
+    }).catch((err) => logger.warn({ err, scanJobId }, "Failed to append scan requested event"));
   } catch (createErr) {
-    await releaseTemplateScanSlot(request.sellerId, request.templateId).catch(() => {});
+    await releaseTemplateScanSlot(request.sellerId, request.templateId).catch((err) => logger.warn({ err, templateId: request.templateId }, "Failed to release scan slot on error"));
     logger.error(
       { createErr, requestId, sellerId: request.sellerId, templateId: request.templateId },
       "Failed to create scan job"
@@ -862,7 +1140,7 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
       request.sellerId,
       request.templateId,
       scanJobId
-    ).catch(() => {});
+    ).catch((err) => logger.warn({ err, scanJobId }, "Failed to clear binding on capacity limit"));
 
     return c.json(
       {
@@ -900,6 +1178,8 @@ scanRoute.get("/scan/status/:jobId", authMiddleware, async (c) => {
   }
 
   try {
+    const initialJob = await getScanJob(jobId);
+    await reconcileJobStateFromGitHub(initialJob);
     const job = await getScanJob(jobId);
     const metadata = (job.metadata || {}) as Record<string, unknown>;
     const reportUrlFromMetadata =
@@ -1128,7 +1408,7 @@ scanRoute.post("/github-webhook", async (c) => {
     await failScanJob(
       job,
       "failed",
-      "DISPATCH_FAILED",
+      "WORKFLOW_RUN_FAILED",
       `GitHub workflow completed with conclusion: ${runConclusion || "unknown"}`,
       deliveryId
     );
@@ -1136,139 +1416,17 @@ scanRoute.post("/github-webhook", async (c) => {
     return c.json({ success: true, status: "failed" });
   }
 
-  await updateScanJob(String(job.id), {
-    status: "artifact_processing",
-    github_run_attempt: workflowRun.run_attempt,
-  });
-
-  await publishStatusEvent(
-    String(job.id),
-    "artifact_processing",
-    "Processing report artifact from GitHub...",
-    {
-      templateId: String(job.template_id),
-      githubRunId,
-    }
+  const finalized = await finalizeSuccessfulGitHubRun(
+    job,
+    githubRunId,
+    workflowRun.run_attempt,
+    workflowRun.html_url || undefined,
+    deliveryId
   );
-
-  try {
-    const runRepo = resolveRunRepoFullName(job);
-    const explicitInstallationId =
-      runRepo.toLowerCase() === String(job.source_repo).toLowerCase() &&
-      job.github_installation_id
-        ? Number(job.github_installation_id)
-        : undefined;
-    const repoContext = await getRepoContext(runRepo, explicitInstallationId);
-
-    const artifacts = await downloadScanArtifacts(repoContext, Number(githubRunId));
-    if (!artifacts.pdfBuffer || !artifacts.resultJson) {
-      await failScanJob(
-        job,
-        "failed",
-        "ARTIFACT_NOT_FOUND",
-        "GitHub run completed but required artifacts (report.pdf and scan-result.json) were not found.",
-        deliveryId
-      );
-      return c.json({ success: true, status: "failed", code: "ARTIFACT_NOT_FOUND" });
-    }
-
-    const parsedResult = (() => {
-      try {
-        const parsed = JSON.parse(artifacts.resultJson || "{}");
-        return scanResultArtifactSchema.parse(parsed);
-      } catch {
-        return null;
-      }
-    })();
-
-    if (!parsedResult) {
-      await failScanJob(
-        job,
-        "failed",
-        "RESULT_PARSE_FAILED",
-        "scan-result.json is missing required fields or has invalid format.",
-        deliveryId
-      );
-      return c.json({ success: true, status: "failed", code: "RESULT_PARSE_FAILED" });
-    }
-
-    const overallRating = parsedResult.overallRating as ScanRating;
-    const finalStatus: ExtendedScanStatus = isPublishableRating(overallRating)
-      ? "completed"
-      : "review_required";
-    const templateScanStatus = isPublishableRating(overallRating) ? "clean" : "review_required";
-    const completedAt = new Date().toISOString();
-    const reportFileName = `security-report-${job.id}.pdf`;
-    const uploaded = await uploadScanReportPdf(String(job.id), reportFileName, artifacts.pdfBuffer);
-
-    await updateScanJob(String(job.id), {
-      status: finalStatus,
-      completed_at: completedAt,
-      risk_level: parsedResult.riskLevel,
-      overall_rating: overallRating,
-      overall_score: Math.round(parsedResult.overallScore),
-      rating_secrets: parsedResult.categoryRatings.secrets,
-      rating_prompt_injection: parsedResult.categoryRatings.promptInjection,
-      rating_dependencies: parsedResult.categoryRatings.dependencies,
-      rating_permissions: parsedResult.categoryRatings.permissions,
-      rating_sast: parsedResult.categoryRatings.sast,
-      seller_color_light: RATING_TO_COLOR[overallRating],
-      llm_summary: parsedResult.summary,
-      llm_recommendations: parsedResult.recommendations as unknown,
-      artifact_name: artifacts.reportArtifactName || undefined,
-      artifact_file_id: uploaded.fileId,
-      artifact_url_github: workflowRun.html_url || undefined,
-      failure_code: undefined,
-      failure_reason: undefined,
-      error_message: undefined,
-      metadata: {
-        ...(job.metadata || {}),
-        reportUrl: uploaded.assetUrl,
-        githubRunId,
-        severityCounts: parsedResult.severityCounts,
-        scanResultArtifactName: artifacts.resultArtifactName,
-      },
-    });
-
-    await updateTemplateScanFields(String(job.template_id), {
-      scan_rating: overallRating,
-      scan_score: Math.round(parsedResult.overallScore),
-      scan_color_light: RATING_TO_COLOR[overallRating],
-      last_scan_at: completedAt,
-      last_scan_job_id: String(job.id),
-      scan_status: templateScanStatus,
-    });
-
-    await publishStatusEvent(String(job.id), finalStatus, "Scan complete. Report ready.", {
-      templateId: String(job.template_id),
-      status: finalStatus,
-      rating: overallRating,
-      score: Math.round(parsedResult.overallScore),
-      reportUrl: uploaded.assetUrl,
-      artifactFileId: uploaded.fileId,
-      githubRunId,
-    });
-
-    await clearTemplateBindingIfMatches(
-      String(job.seller_id),
-      String(job.template_id),
-      String(job.id)
-    ).catch(() => {});
-
-    return c.json({
-      success: true,
-      status: finalStatus,
-      artifactFileId: uploaded.fileId,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await failScanJob(
-      job,
-      "failed",
-      "ARTIFACT_DOWNLOAD_FAILED",
-      message,
-      deliveryId
-    );
-    return c.json({ success: true, status: "failed", code: "ARTIFACT_DOWNLOAD_FAILED" });
-  }
+  return c.json({
+    success: true,
+    status: finalized.status,
+    code: finalized.code,
+    artifactFileId: finalized.artifactFileId,
+  });
 });

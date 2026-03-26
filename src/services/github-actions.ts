@@ -1,6 +1,7 @@
 import { createAppAuth } from "@octokit/auth-app";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import AdmZip from "adm-zip";
+import sodium from "libsodium-wrappers";
 import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
 import { getWorkflowYaml, WORKFLOW_PATH } from "./github-workflow-template.js";
@@ -47,6 +48,46 @@ export interface PlatformWorkflowDispatchDiagnostics {
   workflowAccess: { ok: boolean; status: number; message?: string };
 }
 
+export type PlatformWorkflowConfigSyncCode =
+  | "NOT_RUN"
+  | "OK"
+  | "WORKFLOW_CONFIG_INVALID"
+  | "WORKFLOW_SECRET_SYNC_FAILED";
+
+export interface PlatformWorkflowConfigSyncState {
+  status: "unknown" | "ok" | "error";
+  code: PlatformWorkflowConfigSyncCode;
+  message?: string;
+  checkedAt?: string;
+  lastSyncAt?: string;
+  workflowRepo: { owner: string; repo: string; ref: string };
+  syncedSecrets: string[];
+  syncedVariables: string[];
+}
+
+const platformWorkflowConfigSyncState: PlatformWorkflowConfigSyncState = {
+  status: "unknown",
+  code: "NOT_RUN",
+  workflowRepo: { owner: "", repo: "", ref: "main" },
+  syncedSecrets: [],
+  syncedVariables: [],
+};
+
+const REQUIRED_PLATFORM_CONFIG_KEYS = [
+  "CHUTES_API_KEY",
+  "CHUTES_BASE_URL",
+  "CHUTES_MODEL",
+  "GITHUB_APP_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+] as const;
+
+const PLATFORM_WORKFLOW_SECRETS = ["AI_API_TOKEN", "GITHUB_APP_PRIVATE_KEY"] as const;
+const PLATFORM_WORKFLOW_VARIABLES = [
+  "AI_API_ENDPOINT",
+  "COPILOT_DEFAULT_MODEL",
+  "GITHUB_APP_ID",
+] as const;
+
 export class GitHubApiError extends Error {
   status: number;
   path: string;
@@ -58,6 +99,237 @@ export class GitHubApiError extends Error {
     this.status = status;
     this.path = path;
     this.responseText = responseText;
+  }
+}
+
+interface GitHubActionsSecretPublicKey {
+  key_id: string;
+  key: string;
+}
+
+function setPlatformWorkflowConfigSyncState(
+  patch: Partial<PlatformWorkflowConfigSyncState>
+): PlatformWorkflowConfigSyncState {
+  platformWorkflowConfigSyncState.status =
+    patch.status ?? platformWorkflowConfigSyncState.status;
+  platformWorkflowConfigSyncState.code =
+    patch.code ?? platformWorkflowConfigSyncState.code;
+  platformWorkflowConfigSyncState.message =
+    patch.message ?? platformWorkflowConfigSyncState.message;
+  platformWorkflowConfigSyncState.checkedAt =
+    patch.checkedAt ?? platformWorkflowConfigSyncState.checkedAt;
+  platformWorkflowConfigSyncState.lastSyncAt =
+    patch.lastSyncAt ?? platformWorkflowConfigSyncState.lastSyncAt;
+  platformWorkflowConfigSyncState.workflowRepo =
+    patch.workflowRepo ?? platformWorkflowConfigSyncState.workflowRepo;
+  platformWorkflowConfigSyncState.syncedSecrets = patch.syncedSecrets
+    ? [...patch.syncedSecrets]
+    : platformWorkflowConfigSyncState.syncedSecrets;
+  platformWorkflowConfigSyncState.syncedVariables = patch.syncedVariables
+    ? [...patch.syncedVariables]
+    : platformWorkflowConfigSyncState.syncedVariables;
+
+  return getPlatformWorkflowConfigSyncState();
+}
+
+function buildPlatformWorkflowRepoInfo(): { owner: string; repo: string; ref: string } {
+  const env = getEnv();
+  return {
+    owner: env.GITHUB_PLATFORM_WORKFLOW_OWNER.trim(),
+    repo: env.GITHUB_PLATFORM_WORKFLOW_REPO.trim(),
+    ref: env.GITHUB_PLATFORM_WORKFLOW_REF.trim() || "main",
+  };
+}
+
+function normalizeSecretValue(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
+
+function validatePlatformWorkflowSyncConfig(): {
+  ok: boolean;
+  missing: string[];
+  values: Record<(typeof REQUIRED_PLATFORM_CONFIG_KEYS)[number], string>;
+} {
+  const env = getEnv();
+  const values = {
+    CHUTES_API_KEY: env.CHUTES_API_KEY.trim(),
+    CHUTES_BASE_URL: env.CHUTES_BASE_URL.trim(),
+    CHUTES_MODEL: env.CHUTES_MODEL.trim(),
+    GITHUB_APP_ID: env.GITHUB_APP_ID.trim(),
+    GITHUB_APP_PRIVATE_KEY: normalizeSecretValue(env.GITHUB_APP_PRIVATE_KEY),
+  };
+
+  const missing = REQUIRED_PLATFORM_CONFIG_KEYS.filter((key) => !values[key]);
+  return { ok: missing.length === 0, missing, values };
+}
+
+async function getRepositoryActionsSecretPublicKey(
+  context: GitHubRepoContext
+): Promise<GitHubActionsSecretPublicKey> {
+  return githubApi<GitHubActionsSecretPublicKey>(
+    context.token,
+    "GET",
+    `/repos/${context.owner}/${context.repo}/actions/secrets/public-key`
+  );
+}
+
+async function upsertRepositoryActionSecret(
+  context: GitHubRepoContext,
+  secretName: string,
+  secretValue: string,
+  publicKey: GitHubActionsSecretPublicKey
+): Promise<void> {
+  await sodium.ready;
+  const encrypted = sodium.crypto_box_seal(
+    Buffer.from(secretValue, "utf8"),
+    Buffer.from(publicKey.key, "base64")
+  );
+  const encryptedValue = Buffer.from(encrypted).toString("base64");
+
+  await githubApi(
+    context.token,
+    "PUT",
+    `/repos/${context.owner}/${context.repo}/actions/secrets/${secretName}`,
+    {
+      encrypted_value: encryptedValue,
+      key_id: publicKey.key_id,
+    }
+  );
+}
+
+async function upsertRepositoryActionVariable(
+  context: GitHubRepoContext,
+  variableName: string,
+  variableValue: string
+): Promise<void> {
+  const variablePath = `/repos/${context.owner}/${context.repo}/actions/variables/${variableName}`;
+
+  try {
+    await githubApi(context.token, "PATCH", variablePath, {
+      name: variableName,
+      value: variableValue,
+    });
+    return;
+  } catch (error) {
+    if (!(error instanceof GitHubApiError) || error.status !== 404) {
+      throw error;
+    }
+  }
+
+  await githubApi(context.token, "POST", `/repos/${context.owner}/${context.repo}/actions/variables`, {
+    name: variableName,
+    value: variableValue,
+  });
+}
+
+export function getPlatformWorkflowConfigSyncState(): PlatformWorkflowConfigSyncState {
+  return {
+    ...platformWorkflowConfigSyncState,
+    workflowRepo: { ...platformWorkflowConfigSyncState.workflowRepo },
+    syncedSecrets: [...platformWorkflowConfigSyncState.syncedSecrets],
+    syncedVariables: [...platformWorkflowConfigSyncState.syncedVariables],
+  };
+}
+
+export function isPlatformWorkflowConfigSyncReady(): boolean {
+  return platformWorkflowConfigSyncState.status === "ok";
+}
+
+export async function syncPlatformWorkflowRuntimeConfigAtStartup(): Promise<PlatformWorkflowConfigSyncState> {
+  const checkedAt = new Date().toISOString();
+  const workflowRepo = buildPlatformWorkflowRepoInfo();
+  setPlatformWorkflowConfigSyncState({
+    checkedAt,
+    workflowRepo,
+    syncedSecrets: [],
+    syncedVariables: [],
+  });
+
+  const validated = validatePlatformWorkflowSyncConfig();
+  if (!validated.ok) {
+    return setPlatformWorkflowConfigSyncState({
+      status: "error",
+      code: "WORKFLOW_CONFIG_INVALID",
+      message: `Missing required platform workflow config: ${validated.missing.join(", ")}`,
+      checkedAt,
+      workflowRepo,
+      syncedSecrets: [],
+      syncedVariables: [],
+    });
+  }
+
+  try {
+    const workflowRepoContext = await getPlatformWorkflowContext();
+    const publicKey = await getRepositoryActionsSecretPublicKey(workflowRepoContext);
+
+    const secretValues: Record<(typeof PLATFORM_WORKFLOW_SECRETS)[number], string> = {
+      AI_API_TOKEN: validated.values.CHUTES_API_KEY,
+      GITHUB_APP_PRIVATE_KEY: validated.values.GITHUB_APP_PRIVATE_KEY,
+    };
+
+    const variableValues: Record<(typeof PLATFORM_WORKFLOW_VARIABLES)[number], string> = {
+      AI_API_ENDPOINT: validated.values.CHUTES_BASE_URL,
+      COPILOT_DEFAULT_MODEL: validated.values.CHUTES_MODEL,
+      GITHUB_APP_ID: validated.values.GITHUB_APP_ID,
+    };
+
+    const syncedSecrets: string[] = [];
+    const syncedVariables: string[] = [];
+
+    for (const secretName of PLATFORM_WORKFLOW_SECRETS) {
+      await upsertRepositoryActionSecret(
+        workflowRepoContext,
+        secretName,
+        secretValues[secretName],
+        publicKey
+      );
+      syncedSecrets.push(secretName);
+    }
+
+    for (const variableName of PLATFORM_WORKFLOW_VARIABLES) {
+      await upsertRepositoryActionVariable(
+        workflowRepoContext,
+        variableName,
+        variableValues[variableName]
+      );
+      syncedVariables.push(variableName);
+    }
+
+    const lastSyncAt = new Date().toISOString();
+    return setPlatformWorkflowConfigSyncState({
+      status: "ok",
+      code: "OK",
+      message: "Platform workflow config sync completed",
+      checkedAt,
+      lastSyncAt,
+      workflowRepo: {
+        owner: workflowRepoContext.owner,
+        repo: workflowRepoContext.repo,
+        ref: workflowRepoContext.defaultBranch,
+      },
+      syncedSecrets,
+      syncedVariables,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(
+      {
+        err: error,
+        workflowRepo,
+        syncedSecrets: PLATFORM_WORKFLOW_SECRETS,
+        syncedVariables: PLATFORM_WORKFLOW_VARIABLES,
+      },
+      "Failed syncing platform workflow runtime config"
+    );
+    return setPlatformWorkflowConfigSyncState({
+      status: "error",
+      code: "WORKFLOW_SECRET_SYNC_FAILED",
+      message,
+      checkedAt,
+      workflowRepo,
+      syncedSecrets: [],
+      syncedVariables: [],
+    });
   }
 }
 

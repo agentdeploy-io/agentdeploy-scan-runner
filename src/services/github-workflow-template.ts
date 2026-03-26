@@ -28,6 +28,13 @@ jobs:
     permissions:
       contents: read
       security-events: read
+    env:
+      GITHUB_APP_ID: \${{ vars.GITHUB_APP_ID }}
+      GITHUB_APP_PRIVATE_KEY: \${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+      AI_API_TOKEN: \${{ secrets.AI_API_TOKEN }}
+      AI_API_ENDPOINT: \${{ vars.AI_API_ENDPOINT }}
+      COPILOT_DEFAULT_MODEL: \${{ vars.COPILOT_DEFAULT_MODEL }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Resolve source repository
@@ -52,12 +59,23 @@ jobs:
 
       - name: Create GitHub App token for source repository
         id: source-token
+        if: \${{ env.GITHUB_APP_ID != '' && env.GITHUB_APP_PRIVATE_KEY != '' }}
         uses: actions/create-github-app-token@v3
         with:
-          app-id: \${{ vars.GITHUB_APP_ID }}
-          private-key: \${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          app-id: \${{ env.GITHUB_APP_ID }}
+          private-key: \${{ env.GITHUB_APP_PRIVATE_KEY }}
           owner: \${{ steps.source-repo.outputs.owner }}
           repositories: \${{ steps.source-repo.outputs.name }}
+
+      - name: Validate GitHub App credentials
+        if: \${{ env.GITHUB_APP_ID == '' || env.GITHUB_APP_PRIVATE_KEY == '' }}
+        shell: bash
+        run: |
+          echo "Missing GitHub App credentials in workflow repository." >&2
+          echo "Required names:" >&2
+          echo "- app id: vars.GITHUB_APP_ID" >&2
+          echo "- private key: secrets.GITHUB_APP_PRIVATE_KEY" >&2
+          exit 1
 
       - name: Checkout source repository
         uses: actions/checkout@v4
@@ -68,57 +86,85 @@ jobs:
 
       - name: Run TruffleHog
         id: trufflehog
-        uses: trufflesecurity/trufflehog@main
-        with:
-          extra_args: --results=verified,unknown
-        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          docker run --rm \
+            -v "$PWD:/repo" \
+            trufflesecurity/trufflehog:latest \
+            filesystem /repo --results=verified,unknown --json > trufflehog-output.json
+          CODE=$?
+          set -e
+
+          if [ $CODE -eq 0 ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Run Semgrep
         id: semgrep
         shell: bash
         run: |
+          set +e
           docker run --rm \
             -v "$PWD:/src" \
             -w /src \
             semgrep/semgrep:latest \
-            semgrep --config p/security-audit --error
-        continue-on-error: true
+            semgrep --config p/security-audit --error --json > semgrep-output.json
+          CODE=$?
+          set -e
+
+          if [ $CODE -eq 0 ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Run SecurityLab Taskflow Agent
         id: seclab
         shell: bash
         env:
-          AI_API_TOKEN: \${{ secrets.AI_API_TOKEN }}
+          AI_API_TOKEN: \${{ env.AI_API_TOKEN }}
+          AI_API_ENDPOINT: \${{ env.AI_API_ENDPOINT }}
+          COPILOT_DEFAULT_MODEL: \${{ env.COPILOT_DEFAULT_MODEL }}
           GH_TOKEN: \${{ steps.source-token.outputs.token }}
         run: |
           if [ -z "$AI_API_TOKEN" ]; then
-            echo "status=missing_ai_api_token" >> "$GITHUB_OUTPUT"
-            echo "AI_API_TOKEN is not configured; SecurityLab taskflow scan was not executed." > seclab-taskflow-output.txt
-            exit 0
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "AI_API_TOKEN is not configured; SecurityLab taskflow scan is mandatory." > seclab-taskflow-output.txt
+            exit 1
           fi
 
           if ! docker pull ghcr.io/githubsecuritylab/seclab-taskflow-agent:latest > seclab-taskflow-output.txt 2>&1; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
 
           if ! docker run --rm \
             -e AI_API_TOKEN="$AI_API_TOKEN" \
+            -e AI_API_ENDPOINT="$AI_API_ENDPOINT" \
+            -e COPILOT_DEFAULT_MODEL="$COPILOT_DEFAULT_MODEL" \
             -e GH_TOKEN="$GH_TOKEN" \
             ghcr.io/githubsecuritylab/seclab-taskflow-agent:latest \
             -p seclab_taskflow_agent.personalities.assistant \
             "Analyze repository \${{ steps.source-repo.outputs.full }} for agent-security risks. Focus on prompt injection paths, dependency/supply-chain exposure, and permission abuse risk. Return concise findings with severity labels." \
             >> seclab-taskflow-output.txt 2>&1; then
             echo "status=failed" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
 
           echo "status=executed" >> "$GITHUB_OUTPUT"
 
       - name: Compile markdown report
+        if: \${{ always() }}
         run: |
-          TRUFFLEHOG_OUTCOME="\${{ steps.trufflehog.outcome }}"
-          SEMGREP_OUTCOME="\${{ steps.semgrep.outcome }}"
+          TRUFFLEHOG_OUTCOME="\${{ steps.trufflehog.outputs.status || 'failure' }}"
+          SEMGREP_OUTCOME="\${{ steps.semgrep.outputs.status || 'failure' }}"
           SECLAB_STATUS="\${{ steps.seclab.outputs.status }}"
 
           TRUFFLEHOG_DISPLAY="⚠️ Scan Failed"
@@ -139,8 +185,6 @@ jobs:
 
           if [ "$SECLAB_STATUS" = "executed" ]; then
             SECLAB_DISPLAY="✅ Completed"
-          elif [ "$SECLAB_STATUS" = "missing_ai_api_token" ]; then
-            SECLAB_DISPLAY="🟡 Not Configured"
           elif [ "$SECLAB_STATUS" = "failed" ]; then
             SECLAB_DISPLAY="⚠️ Execution Failed"
           fi
@@ -169,9 +213,10 @@ jobs:
           fi
 
       - name: Build machine-readable scan result
+        if: \${{ always() }}
         run: |
-          TRUFFLEHOG_STATUS="\${{ steps.trufflehog.outcome }}"
-          SEMGREP_STATUS="\${{ steps.semgrep.outcome }}"
+          TRUFFLEHOG_STATUS="\${{ steps.trufflehog.outputs.status || 'failure' }}"
+          SEMGREP_STATUS="\${{ steps.semgrep.outputs.status || 'failure' }}"
           SECLAB_STATUS="\${{ steps.seclab.outputs.status }}"
 
           SECRETS_RATING="A"
@@ -200,12 +245,12 @@ jobs:
             HIGH_COUNT=$((HIGH_COUNT + 1))
           fi
 
-          if [ "$SECLAB_STATUS" = "missing_ai_api_token" ] || [ "$SECLAB_STATUS" = "failed" ]; then
-            PROMPT_INJECTION_RATING="B"
-            DEPENDENCIES_RATING="B"
-            PERMISSIONS_RATING="B"
+          if [ "$SECLAB_STATUS" != "executed" ]; then
+            PROMPT_INJECTION_RATING="C"
+            DEPENDENCIES_RATING="C"
+            PERMISSIONS_RATING="C"
             TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
-            MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
+            HIGH_COUNT=$((HIGH_COUNT + 1))
           elif [ "$SECLAB_STATUS" = "executed" ] && [ -f seclab-taskflow-output.txt ]; then
             if grep -Eiq '(critical|remote code execution|token exfiltration|privilege escalation)' seclab-taskflow-output.txt; then
               PROMPT_INJECTION_RATING="C"
@@ -271,20 +316,31 @@ jobs:
             "summary": "Automated workflow scan completed using TruffleHog, Semgrep, and SecurityLab taskflow agent. Inspect workflow logs and artifacts for full output.",
             "recommendations": [
               "Review workflow logs and repository findings in detail.",
-              "Ensure AI_API_TOKEN is configured so SecurityLab taskflow agent runs on every scan.",
+              "SecurityLab taskflow agent execution is mandatory for a valid scan.",
               "Address any non-success tool outcomes before publishing."
             ]
           }
           EOF
 
+      - name: Install PDF tooling
+        if: \${{ always() }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc wkhtmltopdf
+
       - name: Convert markdown to PDF
-        uses: baileyjm02/markdown-to-pdf@v1
-        with:
-          input_path: report.md
-          output_dir: pdf_output
-          theme: github
+        if: \${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p pdf_output
+          if ! pandoc report.md -o pdf_output/report.pdf --pdf-engine=wkhtmltopdf; then
+            printf '%s\n' '<html><body><h1>Scan Report</h1><p>Primary markdown to PDF conversion failed. See artifacts for details.</p></body></html>' > pdf_output/fallback.html
+            wkhtmltopdf pdf_output/fallback.html pdf_output/report.pdf
+          fi
 
       - name: Upload report artifact
+        if: \${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: Certified-Security-Report
@@ -292,7 +348,10 @@ jobs:
             pdf_output/report.pdf
             scan-result.json
             seclab-taskflow-output.txt
+            trufflehog-output.json
+            semgrep-output.json
           retention-days: 7
+          if-no-files-found: warn
 `;
 
 export const WORKFLOW_PATH = ".github/workflows/agent-security-scan.yml";
