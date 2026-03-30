@@ -3,12 +3,12 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { authMiddleware } from "../middleware/auth.js";
 import { rateLimitMiddleware } from "../middleware/rate-limit.js";
-import { appendScanJobEvent, createScanJob, getScanJob, getScanJobByGitHubRunId, listActiveScanJobsForSeller, updateTemplateScanFields, updateScanJob, uploadScanReportPdf, } from "../services/directus.js";
+import { appendScanJobEvent, createScanJob, getScanJob, getScanJobByGitHubRunId, isScanJobEventsLedgerAvailable, listAllActiveScanJobs, listActiveScanJobsForSeller, refreshScanJobEventsLedgerAvailability, updateTemplateScanFields, updateScanJob, uploadScanReportPdf, } from "../services/directus.js";
 import { logger } from "../logger.js";
 import { getScanState, publishScanProgress } from "../services/redis.js";
 import { admitTemplateScan, bindTemplateScanJob, clearTemplateBindingIfMatches, getActiveTemplateIds, releaseTemplateScanSlot, } from "../services/scan-concurrency.js";
 import { cancelScanJob, enqueueScanJob, getScanRunnerStats, isScanJobCancelled, } from "../services/scan-runner.js";
-import { cancelWorkflowRun, dispatchWorkflowRun, downloadScanArtifacts, ensureWorkflowInRepo, findRecentWorkflowRun, getWorkflowRun, GitHubApiError, getPlatformWorkflowConfigSyncState, isPlatformWorkflowConfigSyncReady, getPlatformWorkflowContext, getRepoContext, verifyGitHubWebhookSignature, } from "../services/github-actions.js";
+import { cancelWorkflowRun, dispatchWorkflowRun, downloadScanArtifacts, ensureWorkflowInRepo, findRecentWorkflowRun, getWorkflowRun, GitHubApiError, getPlatformWorkflowContext, getRepoContext, verifyGitHubWebhookSignature, } from "../services/github-actions.js";
 import { getEnv } from "../env.js";
 import { RATING_TO_COLOR } from "../constants.js";
 const MAX_LENGTH = {
@@ -168,18 +168,8 @@ async function publishStatusEvent(jobId, status, message, data) {
 function classifyDispatchError(err) {
     const message = err instanceof Error ? err.message : String(err);
     const text = message.toLowerCase();
-    if (text.includes("workflow_config_invalid")) {
-        return { failureCode: "WORKFLOW_CONFIG_INVALID", status: "failed" };
-    }
-    if (text.includes("workflow_secret_sync_failed")) {
-        return { failureCode: "WORKFLOW_SECRET_SYNC_FAILED", status: "failed" };
-    }
     if (err instanceof GitHubApiError) {
         const path = err.path.toLowerCase();
-        if ((err.status === 403 || err.status === 404) &&
-            path.includes("/contents/.github/workflows/")) {
-            return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
-        }
         if ((err.status === 401 || err.status === 403) &&
             path.includes("/actions/workflows/")) {
             return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
@@ -206,9 +196,6 @@ function classifyDispatchError(err) {
     if (text.includes("resource not accessible by integration")) {
         return { failureCode: "WORKFLOW_SEED_PERMISSION_DENIED", status: "failed" };
     }
-    if (text.includes("seed") || text.includes("contents")) {
-        return { failureCode: "WORKFLOW_SEED_FAILED", status: "failed" };
-    }
     return { failureCode: "DISPATCH_FAILED", status: "failed" };
 }
 function buildDispatchFailureReason(err, classified, workflowFile) {
@@ -227,12 +214,6 @@ function buildDispatchFailureReason(err, classified, workflowFile) {
     if (classified.failureCode === "WORKFLOW_NOT_FOUND") {
         return `GitHub workflow "${workflowFile}" was not found in the configured workflow repository/ref.`;
     }
-    if (classified.failureCode === "WORKFLOW_CONFIG_INVALID") {
-        return "Scanner is missing required platform workflow runtime configuration (CHUTES_API_KEY, CHUTES_BASE_URL, CHUTES_MODEL, GITHUB_APP_ID, or GITHUB_APP_PRIVATE_KEY).";
-    }
-    if (classified.failureCode === "WORKFLOW_SECRET_SYNC_FAILED") {
-        return "Scanner failed to sync required GitHub Actions secrets/variables into the platform workflow repository.";
-    }
     if (classified.failureCode === "GITHUB_RATE_LIMITED") {
         return "GitHub rate limiting or queue delay detected. Please retry shortly.";
     }
@@ -245,9 +226,6 @@ function throwIfCancelled(jobId) {
     if (isScanJobCancelled(jobId)) {
         throw new Error("Scan cancelled by user");
     }
-}
-function isPlatformWorkflowProvider(provider) {
-    return provider === "github_actions_platform";
 }
 function isPublishableRating(rating) {
     return rating === "A" || rating === "B";
@@ -306,32 +284,54 @@ async function finalizeSuccessfulGitHubRun(job, githubRunId, githubRunAttempt, w
         const completedAt = new Date().toISOString();
         const reportFileName = `security-report-${job.id}.pdf`;
         const uploaded = await uploadScanReportPdf(String(job.id), reportFileName, artifacts.pdfBuffer);
-        await updateScanJob(String(job.id), {
+        await applyScanStateTransition(job, {
             status: finalStatus,
-            completed_at: completedAt,
-            risk_level: parsedResult.riskLevel,
-            overall_rating: overallRating,
-            overall_score: Math.round(parsedResult.overallScore),
-            rating_secrets: parsedResult.categoryRatings.secrets,
-            rating_prompt_injection: parsedResult.categoryRatings.promptInjection,
-            rating_dependencies: parsedResult.categoryRatings.dependencies,
-            rating_permissions: parsedResult.categoryRatings.permissions,
-            rating_sast: parsedResult.categoryRatings.sast,
-            seller_color_light: RATING_TO_COLOR[overallRating],
-            llm_summary: parsedResult.summary,
-            llm_recommendations: parsedResult.recommendations,
-            artifact_name: artifacts.reportArtifactName || undefined,
-            artifact_file_id: uploaded.fileId,
-            artifact_url_github: workflowHtmlUrl || undefined,
-            failure_code: undefined,
-            failure_reason: undefined,
-            error_message: undefined,
-            metadata: {
-                ...(job.metadata || {}),
+            message: "Scan complete. Report ready.",
+            patch: {
+                completed_at: completedAt,
+                risk_level: parsedResult.riskLevel,
+                overall_rating: overallRating,
+                overall_score: Math.round(parsedResult.overallScore),
+                rating_secrets: parsedResult.categoryRatings.secrets,
+                rating_prompt_injection: parsedResult.categoryRatings.promptInjection,
+                rating_dependencies: parsedResult.categoryRatings.dependencies,
+                rating_permissions: parsedResult.categoryRatings.permissions,
+                rating_sast: parsedResult.categoryRatings.sast,
+                seller_color_light: RATING_TO_COLOR[overallRating],
+                llm_summary: parsedResult.summary,
+                llm_recommendations: parsedResult.recommendations,
+                artifact_name: artifacts.reportArtifactName || undefined,
+                artifact_file_id: uploaded.fileId,
+                artifact_url_github: workflowHtmlUrl || undefined,
+                failure_code: undefined,
+                failure_reason: undefined,
+                error_message: undefined,
+                metadata: {
+                    ...(job.metadata || {}),
+                    reportUrl: uploaded.assetUrl,
+                    githubRunId,
+                    severityCounts: parsedResult.severityCounts,
+                    scanResultArtifactName: artifacts.resultArtifactName,
+                },
+            },
+            eventData: {
+                templateId: String(job.template_id),
+                status: finalStatus,
+                rating: overallRating,
+                score: Math.round(parsedResult.overallScore),
                 reportUrl: uploaded.assetUrl,
+                artifactFileId: uploaded.fileId,
                 githubRunId,
-                severityCounts: parsedResult.severityCounts,
-                scanResultArtifactName: artifacts.resultArtifactName,
+            },
+            appendEvent: {
+                eventSource: "github_webhook",
+                eventType: "scan_terminal_success",
+                providerEventId,
+                payload: {
+                    status: finalStatus,
+                    githubRunId,
+                    artifactFileId: uploaded.fileId,
+                },
             },
         });
         await updateTemplateScanFields(String(job.template_id), {
@@ -342,16 +342,6 @@ async function finalizeSuccessfulGitHubRun(job, githubRunId, githubRunAttempt, w
             last_scan_job_id: String(job.id),
             scan_status: templateScanStatus,
         });
-        await publishStatusEvent(String(job.id), finalStatus, "Scan complete. Report ready.", {
-            templateId: String(job.template_id),
-            status: finalStatus,
-            rating: overallRating,
-            score: Math.round(parsedResult.overallScore),
-            reportUrl: uploaded.assetUrl,
-            artifactFileId: uploaded.fileId,
-            githubRunId,
-        });
-        await clearTemplateBindingIfMatches(String(job.seller_id), String(job.template_id), String(job.id)).catch((err) => logger.warn({ err, jobId: job.id }, "Failed to clear template binding"));
         return {
             status: finalStatus,
             artifactFileId: uploaded.fileId,
@@ -418,32 +408,55 @@ async function reconcileJobStateFromGitHub(job) {
         }, "Failed to reconcile scan job state from GitHub run");
     }
 }
-async function failScanJob(job, status, failureCode, failureReason, deliveryId) {
-    const now = new Date().toISOString();
+async function applyScanStateTransition(job, input) {
     const jobId = String(job.id);
-    await updateScanJob(jobId, {
-        status,
-        failure_code: failureCode,
-        failure_reason: failureReason,
-        error_message: failureReason,
-        completed_at: TERMINAL_STATUSES.has(status) ? now : undefined,
-    }).catch((err) => {
-        logger.error({ err, jobId, failureCode }, "Failed to update failed scan job state");
-    });
-    await appendScanJobEvent({
-        scanJobId: jobId,
-        eventSource: "app",
-        eventType: `scan_failed:${failureCode}`,
-        providerEventId: deliveryId,
-        payload: { failureCode, failureReason, status },
-    }).catch((err) => logger.warn({ err, jobId }, "Failed to append scan job event"));
-    await publishStatusEvent(jobId, status, failureReason, {
-        templateId: String(job.template_id),
-        failureCode,
-    });
-    if (TERMINAL_STATUSES.has(status)) {
-        await clearTemplateBindingIfMatches(String(job.seller_id), String(job.template_id), jobId).catch((err) => logger.warn({ err, jobId }, "Failed to clear template binding on failure"));
+    const isTerminal = TERMINAL_STATUSES.has(input.status);
+    const patch = {
+        ...(input.patch || {}),
+        status: input.status,
+    };
+    if (isTerminal && !patch.completed_at) {
+        patch.completed_at = new Date().toISOString();
     }
+    await updateScanJob(jobId, patch).catch((err) => {
+        logger.error({ err, jobId, status: input.status }, "Failed to apply scan state transition");
+    });
+    if (input.appendEvent) {
+        await appendScanJobEvent({
+            scanJobId: jobId,
+            eventSource: input.appendEvent.eventSource,
+            eventType: input.appendEvent.eventType,
+            providerEventId: input.appendEvent.providerEventId,
+            payload: input.appendEvent.payload || {},
+        }).catch((err) => logger.warn({ err, jobId }, "Failed to append scan job event"));
+    }
+    await publishStatusEvent(jobId, input.status, input.message, input.eventData);
+    if (isTerminal) {
+        await clearTemplateBindingIfMatches(String(job.seller_id), String(job.template_id), jobId).catch((err) => logger.warn({ err, jobId }, "Failed to clear template binding on terminal transition"));
+    }
+}
+async function failScanJob(job, status, failureCode, failureReason, deliveryId) {
+    await applyScanStateTransition(job, {
+        status,
+        message: failureReason,
+        patch: {
+            failure_code: failureCode,
+            failure_reason: failureReason,
+            error_message: failureReason,
+        },
+        eventData: {
+            templateId: String(job.template_id),
+            failureCode,
+            failureReason,
+            status,
+        },
+        appendEvent: {
+            eventSource: "app",
+            eventType: `scan_failed:${failureCode}`,
+            providerEventId: deliveryId,
+            payload: { failureCode, failureReason, status },
+        },
+    });
 }
 function getActiveJobTtlMs() {
     const env = getEnv();
@@ -480,17 +493,46 @@ async function reconcileStaleActiveJobsForSeller(sellerId) {
     }
     return staleJobs.length;
 }
+export async function runScanMaintenanceSweep(maxJobs = 200) {
+    const result = {
+        checked: 0,
+        staleReset: 0,
+        githubReconciled: 0,
+        errors: 0,
+    };
+    const jobs = await listAllActiveScanJobs(maxJobs);
+    result.checked = jobs.length;
+    if (jobs.length === 0) {
+        return result;
+    }
+    const nowMs = Date.now();
+    const ttlMs = getActiveJobTtlMs();
+    const ttlMinutes = Math.round(ttlMs / (60 * 1000));
+    for (const job of jobs) {
+        const jobId = String(job.id);
+        const sellerId = String(job.seller_id);
+        const templateId = String(job.template_id);
+        try {
+            if (isStaleActiveJob(job, nowMs, ttlMs)) {
+                result.staleReset += 1;
+                await failScanJob({ id: jobId, seller_id: sellerId, template_id: templateId }, "failed", "STALE_ACTIVE_JOB", `Scan job exceeded ${ttlMinutes} minutes in an active state and was reset. Retry manually.`);
+                continue;
+            }
+            if (job.github_run_id) {
+                result.githubReconciled += 1;
+                await reconcileJobStateFromGitHub(job);
+            }
+        }
+        catch (err) {
+            result.errors += 1;
+            logger.warn({ err, jobId, sellerId, templateId, githubRunId: job.github_run_id }, "Scan maintenance sweep failed for active job");
+        }
+    }
+    return result;
+}
 async function dispatchGitHubScan(jobId, request) {
     const startedAtMs = Date.now();
     const env = getEnv();
-    const usePlatformWorkflow = isPlatformWorkflowProvider(env.SCAN_PROVIDER);
-    if (usePlatformWorkflow && !isPlatformWorkflowConfigSyncReady()) {
-        const syncState = getPlatformWorkflowConfigSyncState();
-        const code = syncState.code === "WORKFLOW_CONFIG_INVALID"
-            ? "WORKFLOW_CONFIG_INVALID"
-            : "WORKFLOW_SECRET_SYNC_FAILED";
-        throw new Error(`${code}: ${syncState.message || "Platform workflow config sync is not ready"}`);
-    }
     await updateScanJob(jobId, { status: "dispatching" });
     await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
         templateId: request.templateId,
@@ -498,9 +540,7 @@ async function dispatchGitHubScan(jobId, request) {
     try {
         throwIfCancelled(jobId);
         const sourceRepoContext = await getRepoContext(request.sourceRepo, request.githubInstallationId);
-        const workflowRepoContext = usePlatformWorkflow
-            ? await getPlatformWorkflowContext()
-            : sourceRepoContext;
+        const workflowRepoContext = await getPlatformWorkflowContext();
         throwIfCancelled(jobId);
         await updateScanJob(jobId, {
             github_installation_id: sourceRepoContext.installationId,
@@ -520,42 +560,21 @@ async function dispatchGitHubScan(jobId, request) {
             templateId: request.templateId,
             sellerId: request.sellerId,
         };
-        try {
-            await dispatchWorkflowRun(workflowRepoContext, dispatchInput);
-        }
-        catch (dispatchErr) {
-            const isGitHubApiError = dispatchErr instanceof GitHubApiError;
-            const isMissingWorkflow = isGitHubApiError &&
-                dispatchErr.status === 404 &&
-                dispatchErr.path.includes("/actions/workflows/");
-            const isUnexpectedInput = isGitHubApiError &&
-                dispatchErr.status === 422 &&
-                dispatchErr.responseText.toLowerCase().includes("unexpected inputs");
-            const shouldSeedOrUpdateWorkflow = !usePlatformWorkflow
-                ? isMissingWorkflow
-                : isMissingWorkflow || isUnexpectedInput;
-            if (!shouldSeedOrUpdateWorkflow) {
-                throw dispatchErr;
-            }
-            throwIfCancelled(jobId);
-            await updateScanJob(jobId, { status: "workflow_seeding" });
-            await publishStatusEvent(jobId, "workflow_seeding", usePlatformWorkflow
-                ? "Seeding/updating platform scan workflow..."
-                : "Workflow missing. Seeding workflow in repository...", {
-                templateId: request.templateId,
-                owner: workflowRepoContext.owner,
-                repo: workflowRepoContext.repo,
-            });
-            await ensureWorkflowInRepo(workflowRepoContext, { force: usePlatformWorkflow });
-            throwIfCancelled(jobId);
-            await updateScanJob(jobId, { status: "dispatching" });
-            await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
-                templateId: request.templateId,
-                owner: workflowRepoContext.owner,
-                repo: workflowRepoContext.repo,
-            });
-            await dispatchWorkflowRun(workflowRepoContext, dispatchInput);
-        }
+        throwIfCancelled(jobId);
+        await updateScanJob(jobId, { status: "workflow_seeding" });
+        await publishStatusEvent(jobId, "workflow_seeding", "Validating platform workflow availability...", {
+            templateId: request.templateId,
+            owner: workflowRepoContext.owner,
+            repo: workflowRepoContext.repo,
+        });
+        await ensureWorkflowInRepo(workflowRepoContext);
+        await updateScanJob(jobId, { status: "dispatching" });
+        await publishStatusEvent(jobId, "dispatching", "Dispatching GitHub Actions run...", {
+            templateId: request.templateId,
+            owner: workflowRepoContext.owner,
+            repo: workflowRepoContext.repo,
+        });
+        await dispatchWorkflowRun(workflowRepoContext, dispatchInput);
         throwIfCancelled(jobId);
         const runLookup = await findRecentWorkflowRun(workflowRepoContext, startedAtMs);
         throwIfCancelled(jobId);
@@ -668,6 +687,59 @@ scanRoute.post("/scan/cancel/:jobId", authMiddleware, async (c) => {
         running: cancelState.wasRunning,
     });
 });
+scanRoute.post("/scan/retry/:jobId", authMiddleware, async (c) => {
+    const previousJobId = c.req.param("jobId");
+    if (!previousJobId) {
+        return c.json({ error: { code: "INVALID_JOB_ID", message: "Job ID is required" } }, 400);
+    }
+    const body = await c.req.json().catch(() => null);
+    const parsed = scanCancelSchema.safeParse(body);
+    if (!parsed.success) {
+        return c.json({
+            error: {
+                code: "VALIDATION_ERROR",
+                message: parsed.error.issues.map((i) => i.message).join(", "),
+            },
+        }, 400);
+    }
+    const sellerId = parsed.data.sellerId;
+    const previous = await getScanJob(previousJobId).catch(() => null);
+    if (!previous) {
+        return c.json({ error: { code: "JOB_NOT_FOUND", message: "Scan job not found" } }, 404);
+    }
+    if (String(previous.seller_id) !== String(sellerId)) {
+        return c.json({ error: { code: "FORBIDDEN", message: "Scan job does not belong to seller" } }, 403);
+    }
+    if (!TERMINAL_STATUSES.has(String(previous.status))) {
+        return c.json({
+            accepted: false,
+            code: "SCAN_NOT_TERMINAL",
+            message: "Only terminal scan jobs can be retried",
+            status: previous.status,
+        }, 409);
+    }
+    const retryRequest = {
+        templateId: String(previous.template_id),
+        sellerId: String(previous.seller_id),
+        sourceRepo: String(previous.source_repo),
+        purchaseId: previous.purchase_id ? String(previous.purchase_id) : undefined,
+        buyerId: previous.buyer_id ? String(previous.buyer_id) : undefined,
+        targetRepo: previous.target_repo ? String(previous.target_repo) : undefined,
+        githubInstallationId: typeof previous.github_installation_id === "number" && Number.isFinite(previous.github_installation_id)
+            ? Number(previous.github_installation_id)
+            : undefined,
+    };
+    const response = await fetch(`${c.req.url.replace(`/scan/retry/${previousJobId}`, "/scan")}`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Scanner-Key": c.req.header("X-Scanner-Key") || "",
+        },
+        body: JSON.stringify(retryRequest),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return c.json(payload, response.status);
+});
 scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
     const body = await c.req.json();
     const parsed = scanRequestSchema.safeParse(body);
@@ -682,27 +754,23 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
     const request = parsed.data;
     const env = getEnv();
     const requestId = uuidv4();
-    if (env.SCAN_PROVIDER !== "github_actions" && env.SCAN_PROVIDER !== "github_actions_platform") {
+    if (env.SCAN_PROVIDER !== "github_actions_platform") {
         return c.json({
             accepted: false,
             code: "PROVIDER_NOT_SUPPORTED",
-            message: "Scanner is configured for a non-GitHub provider. Set SCAN_PROVIDER=github_actions_platform or github_actions.",
+            message: "Scanner is configured for a non-platform provider. Set SCAN_PROVIDER=github_actions_platform.",
         }, 503);
     }
-    if (env.SCAN_PROVIDER === "github_actions_platform") {
-        const workflowConfigSync = getPlatformWorkflowConfigSyncState();
-        if (workflowConfigSync.status !== "ok") {
-            const code = workflowConfigSync.code === "WORKFLOW_CONFIG_INVALID"
-                ? "WORKFLOW_CONFIG_INVALID"
-                : "WORKFLOW_SECRET_SYNC_FAILED";
-            return c.json({
-                accepted: false,
-                code,
-                message: workflowConfigSync.message ||
-                    "Platform workflow runtime config is not ready. Startup sync must pass before scans can be dispatched.",
-                workflowConfig: workflowConfigSync,
-            }, 503);
-        }
+    const ledgerAvailable = await refreshScanJobEventsLedgerAvailability().catch((err) => {
+        logger.warn({ err, cached: isScanJobEventsLedgerAvailable() }, "Failed refreshing scan_job_events ledger availability before admission");
+        return false;
+    });
+    if (!ledgerAvailable) {
+        return c.json({
+            accepted: false,
+            code: "SCAN_JOB_EVENTS_LEDGER_UNAVAILABLE",
+            message: "scan_job_events ledger is unavailable (collection missing or permission denied). Fix Directus schema/RBAC before dispatching new scans.",
+        }, 503);
     }
     await reconcileStaleActiveJobsForSeller(request.sellerId).catch((err) => {
         logger.warn({ err, sellerId: request.sellerId }, "Failed to reconcile stale active jobs before scan admission");
@@ -767,9 +835,7 @@ scanRoute.post("/scan", authMiddleware, rateLimitMiddleware, async (c) => {
             rating_sast: "A",
             seller_color_light: "green",
             started_at: new Date().toISOString(),
-            scan_provider: env.SCAN_PROVIDER === "github_actions_platform"
-                ? "github_actions_platform"
-                : "github_actions",
+            scan_provider: "github_actions_platform",
             github_installation_id: request.githubInstallationId,
             github_workflow_id: env.GITHUB_WORKFLOW_FILE,
             github_repo_owner: request.sourceRepo.split("/")[0],
@@ -831,7 +897,10 @@ scanRoute.get("/scan/status/:jobId", authMiddleware, async (c) => {
         return c.json({ error: { code: "INVALID_JOB_ID", message: "Job ID is required" } }, 400);
     }
     try {
-        const initialJob = await getScanJob(jobId);
+        const initialJob = await getScanJob(jobId).catch(() => null);
+        if (!initialJob) {
+            return c.json({ error: { code: "JOB_NOT_FOUND", message: "Scan job not found" } }, 404);
+        }
         await reconcileJobStateFromGitHub(initialJob);
         const job = await getScanJob(jobId);
         const metadata = (job.metadata || {});
@@ -878,7 +947,15 @@ scanRoute.get("/scan/active/:sellerId", authMiddleware, async (c) => {
         await reconcileStaleActiveJobsForSeller(sellerId).catch((err) => {
             logger.warn({ err, sellerId }, "Failed to reconcile stale active jobs");
         });
-        const jobs = await listActiveScanJobsForSeller(sellerId);
+        let jobs = await listActiveScanJobsForSeller(sellerId);
+        if (jobs.length > 0) {
+            await Promise.all(jobs.map(async (job) => {
+                await reconcileJobStateFromGitHub(job).catch((err) => {
+                    logger.warn({ err, sellerId, jobId: String(job.id), githubRunId: job.github_run_id }, "Failed to reconcile active job from GitHub during active listing");
+                });
+            }));
+            jobs = await listActiveScanJobsForSeller(sellerId);
+        }
         const activeTemplateIds = await getActiveTemplateIds(sellerId);
         const withState = await Promise.all(jobs.map(async (job) => ({
             jobId: String(job.id),

@@ -25,7 +25,7 @@ interface ScanJobRecord {
     bundled_line_count?: number;
     exceeded_line_threshold?: boolean;
     metadata?: Record<string, unknown>;
-    scan_provider?: "github_actions" | "github_actions_platform" | "local";
+    scan_provider?: "github_actions_platform";
     github_installation_id?: number;
     github_workflow_id?: string;
     github_run_id?: string;
@@ -86,6 +86,8 @@ export declare class DirectusForbiddenError extends Error {
         fields?: string[];
     });
 }
+export declare function isScanJobEventsLedgerAvailable(): boolean;
+export declare function refreshScanJobEventsLedgerAvailability(): Promise<boolean>;
 export declare function directusRequest<T>(path: string, options?: RequestInit): Promise<T>;
 export declare function createScanJob(record: ScanJobRecord): Promise<{
     id: string;
@@ -110,6 +112,7 @@ export declare function updateSellerSecurityFields(sellerId: string, fields: {
 export declare function getScanJob(id: string): Promise<ScanJobEntity>;
 export declare function getScanJobByGitHubRunId(githubRunId: string): Promise<ScanJobEntity | null>;
 export declare function listActiveScanJobsForSeller(sellerId: string): Promise<ScanJobEntity[]>;
+export declare function listAllActiveScanJobs(limit?: number): Promise<ScanJobEntity[]>;
 export declare function getSellerTemplates(sellerId: string): Promise<Array<{
     id: string;
     scan_rating?: ScanRating;

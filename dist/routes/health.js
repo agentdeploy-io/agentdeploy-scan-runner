@@ -4,11 +4,13 @@ import { resolveScanWsSecret } from "../lib/scan-ws-token.js";
 import { getRedisClient } from "../services/redis.js";
 import { getScanRunnerStats } from "../services/scan-runner.js";
 import { directusRequest } from "../services/directus.js";
+import { isScanJobEventsLedgerAvailable } from "../services/directus.js";
+import { refreshScanJobEventsLedgerAvailability } from "../services/directus.js";
 import { logger } from "../logger.js";
-import { getPlatformWorkflowConfigSyncState } from "../services/github-actions.js";
 export const healthRoute = new Hono();
 healthRoute.get("/health", async (c) => {
     const checks = {};
+    let status = "healthy";
     let healthy = true;
     // Check Redis
     try {
@@ -65,33 +67,27 @@ healthRoute.get("/health", async (c) => {
         checks.github = "error";
         healthy = false;
     }
-    const workflowConfigSync = getPlatformWorkflowConfigSyncState();
-    if (getEnv().SCAN_PROVIDER === "github_actions_platform") {
-        checks.workflow_config_sync = workflowConfigSync.status === "ok" ? "ok" : "error";
-        if (workflowConfigSync.status !== "ok") {
-            healthy = false;
-        }
+    let ledgerAvailable = isScanJobEventsLedgerAvailable();
+    try {
+        ledgerAvailable = await refreshScanJobEventsLedgerAvailability();
     }
-    else {
-        checks.workflow_config_sync = "ok";
+    catch (err) {
+        logger.error({ err }, "Health check: scan_job_events ledger probe failed");
+        ledgerAvailable = false;
+    }
+    checks.scan_job_events_ledger = ledgerAvailable ? "ok" : "error";
+    if (!ledgerAvailable) {
+        status = "degraded";
+        healthy = false;
+    }
+    if (!healthy && status !== "degraded") {
+        status = "unhealthy";
     }
     return c.json({
-        status: healthy ? "healthy" : "unhealthy",
+        status,
         timestamp: new Date().toISOString(),
         checks,
         scanRunner: getScanRunnerStats(),
         provider: getEnv().SCAN_PROVIDER,
-        workflowConfig: {
-            status: workflowConfigSync.status,
-            code: workflowConfigSync.code,
-            message: workflowConfigSync.message,
-            owner: workflowConfigSync.workflowRepo.owner,
-            repo: workflowConfigSync.workflowRepo.repo,
-            ref: workflowConfigSync.workflowRepo.ref,
-            checkedAt: workflowConfigSync.checkedAt,
-            lastSyncAt: workflowConfigSync.lastSyncAt,
-            syncedSecrets: workflowConfigSync.syncedSecrets,
-            syncedVariables: workflowConfigSync.syncedVariables,
-        },
-    }, healthy ? 200 : 503);
+    }, status === "healthy" ? 200 : 503);
 });

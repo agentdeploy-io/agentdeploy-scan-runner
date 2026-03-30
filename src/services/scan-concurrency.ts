@@ -2,7 +2,8 @@ import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
 import { getRedisClient } from "./redis.js";
 
-const RESERVATION_TTL_SECONDS = 60 * 60 * 24;
+const ACTIVE_BINDING_TTL_SECONDS = 60 * 60 * 24;
+const RESERVATION_TTL_SECONDS = 60 * 5;
 const ACTIVE_SET_KEY = (userId: string) => `scan:user:active_templates:${userId}`;
 const TEMPLATE_JOB_KEY = (userId: string, templateId: string) =>
   `scan:user:template_job:${userId}:${templateId}`;
@@ -25,8 +26,9 @@ local templateJobKey = KEYS[1]
 local activeSetKey = KEYS[2]
 local templateId = ARGV[1]
 local maxActive = tonumber(ARGV[2])
-local ttlSec = tonumber(ARGV[3])
-local reservationId = ARGV[4]
+local activeTtlSec = tonumber(ARGV[3])
+local reservationTtlSec = tonumber(ARGV[4])
+local reservationId = ARGV[5]
 
 local existing = redis.call('GET', templateJobKey)
 if existing then
@@ -40,8 +42,8 @@ if count >= maxActive then
 end
 
 redis.call('SADD', activeSetKey, templateId)
-redis.call('EXPIRE', activeSetKey, ttlSec)
-redis.call('SET', templateJobKey, reservationId, 'EX', ttlSec)
+redis.call('EXPIRE', activeSetKey, activeTtlSec)
+redis.call('SET', templateJobKey, reservationId, 'EX', reservationTtlSec)
 return cjson.encode({ state = 'acquired' })
 `;
 
@@ -58,6 +60,7 @@ export async function admitTemplateScan(
     arguments: [
       templateId,
       String(env.SCAN_MAX_ACTIVE_TEMPLATES_PER_USER),
+      String(ACTIVE_BINDING_TTL_SECONDS),
       String(RESERVATION_TTL_SECONDS),
       reservationId,
     ],
@@ -83,9 +86,9 @@ export async function bindTemplateScanJob(
 ): Promise<void> {
   const redis = await getRedisClient();
   await redis.set(TEMPLATE_JOB_KEY(userId, templateId), jobId, {
-    EX: RESERVATION_TTL_SECONDS,
+    EX: ACTIVE_BINDING_TTL_SECONDS,
   });
-  await redis.expire(ACTIVE_SET_KEY(userId), RESERVATION_TTL_SECONDS);
+  await redis.expire(ACTIVE_SET_KEY(userId), ACTIVE_BINDING_TTL_SECONDS);
 }
 
 export async function releaseTemplateScanSlot(

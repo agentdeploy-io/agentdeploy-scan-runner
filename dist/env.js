@@ -25,10 +25,17 @@ const envSchema = z.object({
     SCAN_MAX_PARALLEL_JOBS_PER_INSTANCE: z.coerce.number().int().min(1).max(100).default(6),
     SCAN_MAX_QUEUE_JOBS_PER_INSTANCE: z.coerce.number().int().min(1).max(10000).default(500),
     SCAN_ACTIVE_JOB_TTL_MINUTES: z.coerce.number().int().min(5).max(24 * 60).default(120),
+    SCAN_MAINTENANCE_INTERVAL_SECONDS: z.coerce.number().int().min(15).max(1800).default(30),
+    SCAN_ENFORCE_WORKFLOW_SYNC_GATE: z.coerce.boolean().default(false),
+    SCAN_ENFORCE_LEDGER_GATE: z.coerce.boolean().default(false),
+    SCAN_WORKFLOW_CONFIG_SYNC_MODE: z
+        .enum(["manual", "startup_sync"])
+        .default("manual"), // manual = no auto secret sync (SECURE)
     SCAN_WORKDIR: z.string().optional().default(""),
     SCAN_PROVIDER: z
-        .enum(["github_actions", "github_actions_platform", "local"])
-        .default("github_actions"),
+        .enum(["github_actions_platform"])
+        .default("github_actions_platform"),
+    SCAN_STATE_TTL_SECONDS: z.coerce.number().int().min(60).max(60 * 60 * 24 * 14).default(60 * 60 * 24),
     GITHUB_WEBHOOK_SECRET: stripTrailingQuote.optional().default(""),
     GITHUB_WORKFLOW_FILE: z.string().optional().default("agent-security-scan.yml"),
     GITHUB_WORKFLOW_NAME: z.string().optional().default("Agentic Security Scan"),

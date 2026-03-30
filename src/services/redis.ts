@@ -55,12 +55,27 @@ export async function getRedisClient(): Promise<RedisClientType> {
 
 export interface ScanProgressEvent {
   jobId: string
-  event_type: 'stage' | 'progress' | 'finding' | 'llm_chunk' | 'llm_thinking' | 'complete' | 'error'
+  event_type: 'stage' | 'progress' | 'finding' | 'complete' | 'error'
   stage?: string
   message: string
   progress?: number
   timestamp: string
   data?: Record<string, unknown>
+  sequence?: number
+}
+
+// In-memory sequence counters per job
+const sequenceCounters = new Map<string, number>()
+
+function getNextSequence(jobId: string): number {
+  const current = sequenceCounters.get(jobId) || 0
+  const next = current + 1
+  sequenceCounters.set(jobId, next)
+  return next
+}
+
+export function clearSequenceCounter(jobId: string): void {
+  sequenceCounters.delete(jobId)
 }
 
 /**
@@ -95,20 +110,23 @@ export async function publishWithRetry(
 
 export async function publishScanProgress(
   jobId: string,
-  event: Omit<ScanProgressEvent, 'timestamp'>
-): Promise<void> {
+  event: Omit<ScanProgressEvent, 'timestamp' | 'sequence'>
+): Promise<boolean> {
   const channel = `scan:progress:${jobId}`
   const stateKey = `scan:state:${jobId}`
   const fullEvent: ScanProgressEvent = {
     ...event,
     timestamp: new Date().toISOString(),
+    sequence: getNextSequence(jobId),
   }
 
+  let statePersistSuccess = true
   try {
     const pub = await getPublisher()
-    await pub.set(stateKey, JSON.stringify(fullEvent), { EX: 60 * 60 * 24 })
+    await pub.set(stateKey, JSON.stringify(fullEvent), { EX: getEnv().SCAN_STATE_TTL_SECONDS })
   } catch (err) {
     logger.warn({ err, jobId }, 'Failed to persist latest scan state in Redis')
+    statePersistSuccess = false
   }
 
   const success = await publishWithRetry(channel, fullEvent)
@@ -117,6 +135,9 @@ export async function publishScanProgress(
   } else {
     logger.error({ jobId, event_type: event.event_type, stage: event.stage }, 'Failed to publish scan progress after retries')
   }
+  
+  // Return false only if both state persist and publish failed
+  return statePersistSuccess && success
 }
 
 export async function getScanState(jobId: string): Promise<ScanProgressEvent | null> {
@@ -128,6 +149,17 @@ export async function getScanState(jobId: string): Promise<ScanProgressEvent | n
   } catch (err) {
     logger.warn({ err, jobId }, 'Failed to read scan state from Redis')
     return null
+  }
+}
+
+export async function clearScanState(jobId: string): Promise<void> {
+  try {
+    const client = await getRedisClient()
+    await client.del(`scan:state:${jobId}`)
+    // Also clear the sequence counter for this job
+    clearSequenceCounter(jobId)
+  } catch (err) {
+    logger.warn({ err, jobId }, 'Failed to clear scan state from Redis')
   }
 }
 

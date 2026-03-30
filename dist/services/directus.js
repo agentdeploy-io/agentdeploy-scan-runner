@@ -18,6 +18,23 @@ export class DirectusForbiddenError extends Error {
 }
 let sellerSecurityUpdateForbidden = false;
 let scanJobEventsLedgerUnavailable = false;
+export function isScanJobEventsLedgerAvailable() {
+    return !scanJobEventsLedgerUnavailable;
+}
+export async function refreshScanJobEventsLedgerAvailability() {
+    try {
+        await directusRequest("/items/scan_job_events?limit=1&fields=id");
+        scanJobEventsLedgerUnavailable = false;
+        return true;
+    }
+    catch (error) {
+        if (error instanceof Error && /scan_job_events|forbidden|permission|field|collection/i.test(error.message)) {
+            scanJobEventsLedgerUnavailable = true;
+            return false;
+        }
+        throw error;
+    }
+}
 function authHeaders(extra) {
     const env = getEnv();
     return {
@@ -214,6 +231,33 @@ export async function listActiveScanJobsForSeller(sellerId) {
     }
     catch (error) {
         logger.error({ error, sellerId }, "Failed to list active scan jobs for seller");
+        return [];
+    }
+}
+export async function listAllActiveScanJobs(limit = 200) {
+    const activeStatuses = [
+        "pending",
+        "running",
+        "analyzing",
+        "workflow_seeding",
+        "dispatching",
+        "queued_in_github",
+        "running_in_github",
+        "artifact_processing",
+        "delayed",
+    ].join(",");
+    const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.trunc(limit))) : 200;
+    const query = new URLSearchParams({
+        "filter[status][_in]": activeStatuses,
+        sort: "-started_at",
+        limit: String(safeLimit),
+        fields: "id,template_id,seller_id,status,started_at,completed_at,overall_rating,overall_score,github_run_id,artifact_file_id,source_repo,github_installation_id,github_repo_owner,github_repo_name",
+    });
+    try {
+        return await directusRequest(`/items/scan_jobs?${query.toString()}`);
+    }
+    catch (error) {
+        logger.error({ error, limit: safeLimit }, "Failed to list active scan jobs");
         return [];
     }
 }

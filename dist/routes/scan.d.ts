@@ -27,4 +27,11 @@ declare const scanRequestSchema: z.ZodObject<{
 }>;
 export type ScanRequest = z.infer<typeof scanRequestSchema>;
 export declare const scanRoute: Hono<import("hono/types").BlankEnv, import("hono/types").BlankSchema, "/">;
+export interface ScanMaintenanceSweepResult {
+    checked: number;
+    staleReset: number;
+    githubReconciled: number;
+    errors: number;
+}
+export declare function runScanMaintenanceSweep(maxJobs?: number): Promise<ScanMaintenanceSweepResult>;
 export {};

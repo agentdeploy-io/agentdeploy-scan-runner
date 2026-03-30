@@ -4,7 +4,6 @@ import AdmZip from "adm-zip";
 import sodium from "libsodium-wrappers";
 import { getEnv } from "../env.js";
 import { logger } from "../logger.js";
-import { getWorkflowYaml, WORKFLOW_PATH } from "./github-workflow-template.js";
 
 export interface GitHubRepoContext {
   owner: string;
@@ -77,15 +76,15 @@ const REQUIRED_PLATFORM_CONFIG_KEYS = [
   "CHUTES_API_KEY",
   "CHUTES_BASE_URL",
   "CHUTES_MODEL",
-  "GITHUB_APP_ID",
-  "GITHUB_APP_PRIVATE_KEY",
+  "SCANNER_APP_ID",
+  "SCANNER_APP_PRIVATE_KEY",
 ] as const;
 
-const PLATFORM_WORKFLOW_SECRETS = ["AI_API_TOKEN", "GITHUB_APP_PRIVATE_KEY"] as const;
+const PLATFORM_WORKFLOW_SECRETS = ["AI_API_TOKEN", "SCANNER_APP_PRIVATE_KEY"] as const;
 const PLATFORM_WORKFLOW_VARIABLES = [
   "AI_API_ENDPOINT",
   "COPILOT_DEFAULT_MODEL",
-  "GITHUB_APP_ID",
+  "SCANNER_APP_ID",
 ] as const;
 
 export class GitHubApiError extends Error {
@@ -155,8 +154,8 @@ function validatePlatformWorkflowSyncConfig(): {
     CHUTES_API_KEY: env.CHUTES_API_KEY.trim(),
     CHUTES_BASE_URL: env.CHUTES_BASE_URL.trim(),
     CHUTES_MODEL: env.CHUTES_MODEL.trim(),
-    GITHUB_APP_ID: env.GITHUB_APP_ID.trim(),
-    GITHUB_APP_PRIVATE_KEY: normalizeSecretValue(env.GITHUB_APP_PRIVATE_KEY),
+    SCANNER_APP_ID: env.GITHUB_APP_ID.trim(),
+    SCANNER_APP_PRIVATE_KEY: normalizeSecretValue(env.GITHUB_APP_PRIVATE_KEY),
   };
 
   const missing = REQUIRED_PLATFORM_CONFIG_KEYS.filter((key) => !values[key]);
@@ -264,13 +263,13 @@ export async function syncPlatformWorkflowRuntimeConfigAtStartup(): Promise<Plat
 
     const secretValues: Record<(typeof PLATFORM_WORKFLOW_SECRETS)[number], string> = {
       AI_API_TOKEN: validated.values.CHUTES_API_KEY,
-      GITHUB_APP_PRIVATE_KEY: validated.values.GITHUB_APP_PRIVATE_KEY,
+      SCANNER_APP_PRIVATE_KEY: validated.values.SCANNER_APP_PRIVATE_KEY,
     };
 
     const variableValues: Record<(typeof PLATFORM_WORKFLOW_VARIABLES)[number], string> = {
       AI_API_ENDPOINT: validated.values.CHUTES_BASE_URL,
       COPILOT_DEFAULT_MODEL: validated.values.CHUTES_MODEL,
-      GITHUB_APP_ID: validated.values.GITHUB_APP_ID,
+      SCANNER_APP_ID: validated.values.SCANNER_APP_ID,
     };
 
     const syncedSecrets: string[] = [];
@@ -629,53 +628,23 @@ export async function getPlatformWorkflowDispatchDiagnostics(): Promise<Platform
 }
 
 export async function ensureWorkflowInRepo(
-  context: GitHubRepoContext,
-  options?: { force?: boolean }
+  context: GitHubRepoContext
 ): Promise<void> {
-  const force = options?.force === true;
-  const path = WORKFLOW_PATH;
-  if (!force) {
-    try {
-      await githubApi(
-        context.token,
-        "GET",
-        `/repos/${context.owner}/${context.repo}/contents/${path}?ref=${encodeURIComponent(context.defaultBranch)}`
-      );
-      return;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!message.includes(" 404 ")) {
-        throw err;
-      }
-    }
-  }
-
-  let existingSha: string | undefined;
   try {
-    const existing = await githubApi<{ sha: string }>(
+    const workflowFile = getEnv().GITHUB_WORKFLOW_FILE;
+    await githubApi(
       context.token,
       "GET",
-      `/repos/${context.owner}/${context.repo}/contents/${path}?ref=${encodeURIComponent(context.defaultBranch)}`
+      `/repos/${context.owner}/${context.repo}/actions/workflows/${encodeURIComponent(workflowFile)}`
     );
-    existingSha = existing.sha;
-  } catch {
-    existingSha = undefined;
-  }
-
-  const content = Buffer.from(getWorkflowYaml(), "utf-8").toString("base64");
-  await githubApi(
-    context.token,
-    "PUT",
-    `/repos/${context.owner}/${context.repo}/contents/${path}`,
-    {
-      message: existingSha
-        ? "chore(scanner): update AgentDeploy security scan workflow"
-        : "chore(scanner): seed AgentDeploy security scan workflow",
-      content,
-      branch: context.defaultBranch,
-      sha: existingSha,
+  } catch (error) {
+    if (error instanceof GitHubApiError && error.status === 404) {
+      throw new Error(
+        `GitHub workflow "${getEnv().GITHUB_WORKFLOW_FILE}" was not found in the configured workflow repository/ref.`
+      );
     }
-  );
+    throw error;
+  }
 }
 
 export async function dispatchWorkflowRun(

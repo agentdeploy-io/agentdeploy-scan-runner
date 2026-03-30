@@ -4,8 +4,7 @@ import { cors } from "hono/cors";
 import { getEnv } from "./env.js";
 import { logger } from "./logger.js";
 import { safeLogContext } from "./lib/redact.js";
-import { scanRoute } from "./routes/scan.js";
-import { rescanRoute } from "./routes/rescan.js";
+import { runScanMaintenanceSweep, scanRoute } from "./routes/scan.js";
 import { healthRoute } from "./routes/health.js";
 import { syncRoute } from "./routes/sync.js";
 import { getPlatformWorkflowConfigSyncState, getPlatformWorkflowDispatchDiagnostics, syncPlatformWorkflowRuntimeConfigAtStartup, } from "./services/github-actions.js";
@@ -52,7 +51,6 @@ app.use("*", cors({
 }));
 app.route("/", healthRoute);
 app.route("/", scanRoute);
-app.route("/", rescanRoute);
 app.route("/", syncRoute);
 app.onError((err, c) => {
     // Redact secrets from error before logging
@@ -67,6 +65,10 @@ logger.info({ port }, "Scanner service starting");
 async function runPlatformWorkflowStartupPreflight() {
     if (env.SCAN_PROVIDER !== "github_actions_platform") {
         return;
+    }
+    // SECURE: Skip automatic secret sync - secrets are configured manually in workflow repo
+    if (env.SCAN_WORKFLOW_CONFIG_SYNC_MODE === "manual") {
+        logger.info({ mode: env.SCAN_WORKFLOW_CONFIG_SYNC_MODE }, "Workflow config sync set to manual - skipping automatic secret sync (SECURE MODE)");
     }
     try {
         const diagnostics = await getPlatformWorkflowDispatchDiagnostics();
@@ -108,6 +110,10 @@ async function runPlatformWorkflowStartupPreflight() {
     catch (err) {
         logger.error({ err }, "Platform workflow dispatch preflight check failed");
     }
+    if (env.SCAN_WORKFLOW_CONFIG_SYNC_MODE === "manual") {
+        logger.info({ mode: env.SCAN_WORKFLOW_CONFIG_SYNC_MODE }, "Skipping workflow config sync in manual mode - secrets must be configured manually in workflow repo");
+        return;
+    }
     const syncState = await syncPlatformWorkflowRuntimeConfigAtStartup();
     const syncPayload = {
         code: syncState.code,
@@ -126,6 +132,29 @@ async function runPlatformWorkflowStartupPreflight() {
 }
 const server = createAdaptorServer({ fetch: app.fetch });
 attachScanWebSocketServer(server);
+let maintenanceTimer = null;
+function startScanMaintenanceLoop() {
+    if (env.SCAN_PROVIDER !== "github_actions_platform") {
+        return;
+    }
+    if (maintenanceTimer) {
+        return;
+    }
+    const intervalMs = env.SCAN_MAINTENANCE_INTERVAL_SECONDS * 1000;
+    maintenanceTimer = setInterval(() => {
+        void runScanMaintenanceSweep().then((result) => {
+            if (result.errors > 0 || result.staleReset > 0) {
+                logger.warn(result, "Scan maintenance sweep detected stale/errors");
+            }
+        }).catch((err) => {
+            logger.error({ err }, "Scan maintenance sweep failed");
+        });
+    }, intervalMs);
+    if (typeof maintenanceTimer.unref === "function") {
+        maintenanceTimer.unref();
+    }
+    logger.info({ intervalSeconds: env.SCAN_MAINTENANCE_INTERVAL_SECONDS }, "Started scan maintenance reconciliation loop");
+}
 async function startServer() {
     await runPlatformWorkflowStartupPreflight();
     const syncState = getPlatformWorkflowConfigSyncState();
@@ -139,6 +168,7 @@ async function startServer() {
     server.listen(port, () => {
         logger.info({ port }, "Scanner HTTP+WS server listening");
     });
+    startScanMaintenanceLoop();
 }
 void startServer();
 export { app };
