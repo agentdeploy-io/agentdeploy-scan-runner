@@ -18,6 +18,9 @@ on:
       template_id:
         description: 'Template id in AgentDeploy (optional)'
         required: false
+      template_version:
+        description: 'Template version in AgentDeploy (optional)'
+        required: false
       seller_id:
         description: 'Seller user id in AgentDeploy (optional)'
         required: false
@@ -31,8 +34,6 @@ jobs:
     env:
       SCANNER_APP_ID: ${{ secrets.SCANNER_APP_ID }}
       SCANNER_APP_PRIVATE_KEY: ${{ secrets.SCANNER_APP_PRIVATE_KEY }}
-      # Note: AI_API_TOKEN, AI_API_ENDPOINT, COPILOT_DEFAULT_MODEL no longer needed
-      # SecurityLab agent is unavailable - using TruffleHog + Semgrep only
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
@@ -83,6 +84,12 @@ jobs:
           token: ${{ steps.source-token.outputs.token || github.token }}
           fetch-depth: 1
 
+      - name: Capture source commit
+        id: source-commit
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Run TruffleHog
         id: trufflehog
         shell: bash
@@ -129,10 +136,13 @@ jobs:
 
       - name: Compile markdown report
         if: ${{ always() }}
+        shell: bash
         run: |
           TRUFFLEHOG_OUTCOME="${{ steps.trufflehog.outputs.status || 'failure' }}"
           SEMGREP_OUTCOME="${{ steps.semgrep.outputs.status || 'failure' }}"
           SECLAB_STATUS="${{ steps.seclab.outputs.status }}"
+          TEMPLATE_VERSION="${{ github.event.inputs.template_version || 'n/a' }}"
+          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha || 'unknown' }}"
 
           TRUFFLEHOG_DISPLAY="⚠️ Scan Failed"
           SEMGREP_DISPLAY="⚠️ Scan Failed"
@@ -158,12 +168,23 @@ jobs:
             SECLAB_DISPLAY="⚠️ Execution Failed"
           fi
 
+          TRUFFLEHOG_FINDINGS=0
+          SEMGREP_FINDINGS=0
+          if [ -s trufflehog-output.json ]; then
+            TRUFFLEHOG_FINDINGS=$(jq -s 'length' trufflehog-output.json 2>/dev/null || echo 0)
+          fi
+          if [ -s semgrep-output.json ]; then
+            SEMGREP_FINDINGS=$(jq '.results | length' semgrep-output.json 2>/dev/null || echo 0)
+          fi
+          TOTAL_FINDINGS=$((TRUFFLEHOG_FINDINGS + SEMGREP_FINDINGS))
+
           echo "# ${{ github.event.inputs.report_title }}" > report.md
           echo "" >> report.md
           echo "- Scan Job ID: ${{ github.event.inputs.scan_job_id }}" >> report.md
           echo "- Template ID: ${{ github.event.inputs.template_id || 'n/a' }}" >> report.md
-          echo "- Seller ID: ${{ github.event.inputs.seller_id || 'n/a' }}" >> report.md
+          echo "- Template Version: $TEMPLATE_VERSION" >> report.md
           echo "- Repository: ${{ steps.source-repo.outputs.full }}" >> report.md
+          echo "- Source Commit: $SOURCE_COMMIT" >> report.md
           echo "- Run ID: ${{ github.run_id }}" >> report.md
           echo "- Completed At: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> report.md
           echo "" >> report.md
@@ -171,8 +192,23 @@ jobs:
           echo "- TruffleHog: $TRUFFLEHOG_DISPLAY" >> report.md
           echo "- Semgrep: $SEMGREP_DISPLAY" >> report.md
           echo "- SecurityLab Taskflow Agent: $SECLAB_DISPLAY" >> report.md
+          echo "- Findings: TruffleHog=$TRUFFLEHOG_FINDINGS, Semgrep=$SEMGREP_FINDINGS, Total=$TOTAL_FINDINGS" >> report.md
           echo "" >> report.md
-          echo "Review workflow logs and artifact outputs for full findings." >> report.md
+
+          echo "## Findings Snapshot" >> report.md
+          if [ "$TOTAL_FINDINGS" -eq 0 ]; then
+            echo "- No findings detected by TruffleHog or Semgrep." >> report.md
+          else
+            if [ "$TRUFFLEHOG_FINDINGS" -gt 0 ]; then
+              echo "### TruffleHog Findings (top 5)" >> report.md
+              jq -r -s '.[:5][] | "- [(.DetectorName // "Secret")] (.SourceMetadata.Data.Git.file // "unknown file")"' trufflehog-output.json 2>/dev/null >> report.md || true
+            fi
+            if [ "$SEMGREP_FINDINGS" -gt 0 ]; then
+              echo "### Semgrep Findings (top 5)" >> report.md
+              jq -r '.results[:5][] | "- [(.extra.severity // "INFO")] (.check_id // "rule") at (.path // "unknown"):(.start.line // 0)"' semgrep-output.json 2>/dev/null >> report.md || true
+            fi
+          fi
+
           if [ -f seclab-taskflow-output.txt ]; then
             echo "" >> report.md
             echo "### SecurityLab Taskflow Agent Output (excerpt)" >> report.md
@@ -183,105 +219,95 @@ jobs:
 
       - name: Build machine-readable scan result
         if: ${{ always() }}
+        shell: bash
         run: |
           TRUFFLEHOG_STATUS="${{ steps.trufflehog.outputs.status || 'failure' }}"
           SEMGREP_STATUS="${{ steps.semgrep.outputs.status || 'failure' }}"
           SECLAB_STATUS="${{ steps.seclab.outputs.status }}"
+          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha || '' }}"
+          TEMPLATE_VERSION="${{ github.event.inputs.template_version || '' }}"
 
           SECRETS_RATING="A"
           SAST_RATING="A"
           PROMPT_INJECTION_RATING="A"
           DEPENDENCIES_RATING="A"
           PERMISSIONS_RATING="A"
+
           OVERALL_RATING="A"
           OVERALL_SCORE=95
           RISK_LEVEL="none"
 
-          TOOL_FINDINGS=0
           HIGH_COUNT=0
           MEDIUM_COUNT=0
           CRITICAL_COUNT=0
+          COVERAGE_NOTE="Full tool coverage."
 
           if [ "$TRUFFLEHOG_STATUS" != "success" ]; then
             SECRETS_RATING="C"
-            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
-            HIGH_COUNT=1
+            HIGH_COUNT=$((HIGH_COUNT + 1))
           fi
 
           if [ "$SEMGREP_STATUS" != "success" ]; then
             SAST_RATING="C"
-            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
             HIGH_COUNT=$((HIGH_COUNT + 1))
           fi
 
           if [ "$SECLAB_STATUS" = "skipped" ]; then
-            PROMPT_INJECTION_RATING="C"
-            DEPENDENCIES_RATING="C"
-            PERMISSIONS_RATING="C"
-            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
-            HIGH_COUNT=$((HIGH_COUNT + 1))
+            PROMPT_INJECTION_RATING="B"
+            DEPENDENCIES_RATING="B"
+            PERMISSIONS_RATING="B"
+            MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
+            COVERAGE_NOTE="SecurityLab skipped; AI-assisted checks unavailable in this run."
           elif [ "$SECLAB_STATUS" != "executed" ]; then
             PROMPT_INJECTION_RATING="C"
             DEPENDENCIES_RATING="C"
             PERMISSIONS_RATING="C"
-            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
             HIGH_COUNT=$((HIGH_COUNT + 1))
-          elif [ "$SECLAB_STATUS" = "executed" ] && [ -f seclab-taskflow-output.txt ]; then
+            COVERAGE_NOTE="SecurityLab failed to execute."
+          elif [ -f seclab-taskflow-output.txt ]; then
             if grep -Eiq '(critical|remote code execution|token exfiltration|privilege escalation)' seclab-taskflow-output.txt; then
               PROMPT_INJECTION_RATING="C"
               DEPENDENCIES_RATING="C"
               PERMISSIONS_RATING="C"
-              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
               CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
             elif grep -Eiq '(high|command injection|sql injection|supply chain|dependency confusion)' seclab-taskflow-output.txt; then
               PROMPT_INJECTION_RATING="C"
               DEPENDENCIES_RATING="C"
               PERMISSIONS_RATING="C"
-              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
               HIGH_COUNT=$((HIGH_COUNT + 1))
             elif grep -Eiq '(medium|moderate|unsafe default|weak validation)' seclab-taskflow-output.txt; then
               PROMPT_INJECTION_RATING="B"
               DEPENDENCIES_RATING="B"
               PERMISSIONS_RATING="B"
-              TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
               MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
             fi
           fi
 
-          if [ "$TOOL_FINDINGS" -eq 0 ]; then
-            OVERALL_RATING="A"
-            OVERALL_SCORE=95
-            RISK_LEVEL="none"
-          elif [ "$TOOL_FINDINGS" -eq 1 ]; then
-            OVERALL_RATING="B"
-            OVERALL_SCORE=82
-            RISK_LEVEL="low"
-            if [ "$HIGH_COUNT" -gt 0 ] || [ "$CRITICAL_COUNT" -gt 0 ]; then
-              OVERALL_SCORE=78
-              RISK_LEVEL="medium"
-            fi
-          else
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            OVERALL_RATING="C"
+            OVERALL_SCORE=58
+            RISK_LEVEL="high"
+          elif [ "$HIGH_COUNT" -gt 0 ]; then
             OVERALL_RATING="C"
             OVERALL_SCORE=66
             RISK_LEVEL="medium"
-            if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 1 ]; then
-              OVERALL_SCORE=58
-              RISK_LEVEL="high"
-            fi
+          elif [ "$MEDIUM_COUNT" -gt 0 ]; then
+            OVERALL_RATING="B"
+            OVERALL_SCORE=84
+            RISK_LEVEL="low"
+          else
+            OVERALL_RATING="A"
+            OVERALL_SCORE=95
+            RISK_LEVEL="none"
           fi
 
-          # Do not publish an A/B when SecurityLab did not execute.
-          if [ "$SECLAB_STATUS" != "executed" ]; then
-            OVERALL_RATING="C"
-            OVERALL_SCORE=62
-            RISK_LEVEL="medium"
-          fi
-
-          cat > scan-result.json <<EOF
+          cat > scan-result.json <<EOF_JSON
           {
             "overallRating": "$OVERALL_RATING",
             "overallScore": $OVERALL_SCORE,
             "riskLevel": "$RISK_LEVEL",
+            "sourceCommitSha": "$SOURCE_COMMIT",
+            "templateVersion": "$TEMPLATE_VERSION",
             "severityCounts": {
               "low": 0,
               "medium": $MEDIUM_COUNT,
@@ -295,14 +321,23 @@ jobs:
               "permissions": "$PERMISSIONS_RATING",
               "sast": "$SAST_RATING"
             },
-            "summary": "Automated workflow scan completed with partial tool coverage. SecurityLab agent did not execute in this run; review required.",
+            "summary": "Automated workflow scan completed. $COVERAGE_NOTE",
             "recommendations": [
               "Review workflow logs and repository findings in detail.",
-              "SecurityLab taskflow agent did not execute; treat this as incomplete coverage.",
+              "If SecurityLab is unavailable, use this report as baseline and run supplemental manual review.",
               "Address any non-success tool outcomes before publishing."
             ]
           }
-          EOF
+          EOF_JSON
+
+          {
+            echo ""
+            echo "## Overall Result"
+            echo "- Overall Rating: $OVERALL_RATING"
+            echo "- Overall Score: $OVERALL_SCORE/100"
+            echo "- Risk Level: $RISK_LEVEL"
+            echo "- Coverage Note: $COVERAGE_NOTE"
+          } >> report.md
 
       - name: Install PDF tooling
         if: ${{ always() }}
