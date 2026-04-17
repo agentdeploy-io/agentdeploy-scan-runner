@@ -117,18 +117,15 @@ jobs:
           echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Security Analysis Complete
+      - name: SecurityLab availability check
         id: seclab
         shell: bash
         run: |
-          # TruffleHog and Semgrep provide comprehensive security scanning
-          # SecurityLab AI agent is not available (docker image unavailable)
-          echo "Security scanning completed via TruffleHog (secrets) and Semgrep (SAST)"
-          echo "status=executed" >> "$GITHUB_OUTPUT"
-          echo "Security analysis completed using TruffleHog and Semgrep" > seclab-taskflow-output.txt
-          echo "AI-powered SecurityLab agent was unavailable (docker image not found)" >> seclab-taskflow-output.txt
-          echo "TruffleHog: Secrets detection" >> seclab-taskflow-output.txt
-          echo "Semgrep: Static analysis and vulnerability detection" >> seclab-taskflow-output.txt
+          # SecurityLab agent is currently unavailable in runner environment.
+          # Mark status truthfully so report/scoring does not claim full coverage.
+          echo "status=skipped" >> "$GITHUB_OUTPUT"
+          echo "SecurityLab AI analysis skipped: runtime agent unavailable in workflow environment." > seclab-taskflow-output.txt
+          echo "Fallback scanners executed: TruffleHog, Semgrep." >> seclab-taskflow-output.txt
 
       - name: Compile markdown report
         if: ${{ always() }}
@@ -156,7 +153,7 @@ jobs:
           if [ "$SECLAB_STATUS" = "executed" ]; then
             SECLAB_DISPLAY="✅ Completed"
           elif [ "$SECLAB_STATUS" = "skipped" ]; then
-            SECLAB_DISPLAY="⏭️ Skipped (no AI_API_TOKEN)"
+            SECLAB_DISPLAY="⏭️ Skipped (agent unavailable)"
           elif [ "$SECLAB_STATUS" = "failed" ]; then
             SECLAB_DISPLAY="⚠️ Execution Failed"
           fi
@@ -218,9 +215,11 @@ jobs:
           fi
 
           if [ "$SECLAB_STATUS" = "skipped" ]; then
-            PROMPT_INJECTION_RATING="A"
-            DEPENDENCIES_RATING="A"
-            PERMISSIONS_RATING="A"
+            PROMPT_INJECTION_RATING="C"
+            DEPENDENCIES_RATING="C"
+            PERMISSIONS_RATING="C"
+            TOOL_FINDINGS=$((TOOL_FINDINGS + 1))
+            HIGH_COUNT=$((HIGH_COUNT + 1))
           elif [ "$SECLAB_STATUS" != "executed" ]; then
             PROMPT_INJECTION_RATING="C"
             DEPENDENCIES_RATING="C"
@@ -271,6 +270,13 @@ jobs:
             fi
           fi
 
+          # Do not publish an A/B when SecurityLab did not execute.
+          if [ "$SECLAB_STATUS" != "executed" ]; then
+            OVERALL_RATING="C"
+            OVERALL_SCORE=62
+            RISK_LEVEL="medium"
+          fi
+
           cat > scan-result.json <<EOF
           {
             "overallRating": "$OVERALL_RATING",
@@ -289,10 +295,10 @@ jobs:
               "permissions": "$PERMISSIONS_RATING",
               "sast": "$SAST_RATING"
             },
-            "summary": "Automated workflow scan completed using TruffleHog, Semgrep, and SecurityLab taskflow agent. Inspect workflow logs and artifacts for full output.",
+            "summary": "Automated workflow scan completed with partial tool coverage. SecurityLab agent did not execute in this run; review required.",
             "recommendations": [
               "Review workflow logs and repository findings in detail.",
-              "SecurityLab taskflow agent execution is optional when unavailable; inspect fallback output.",
+              "SecurityLab taskflow agent did not execute; treat this as incomplete coverage.",
               "Address any non-success tool outcomes before publishing."
             ]
           }
