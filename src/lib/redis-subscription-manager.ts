@@ -202,7 +202,7 @@ export class RedisSubscriptionManager {
   private setupReconnection(
     subscriber: RedisClient,
     channel: string,
-    onMessage: (data: unknown) => void
+    onMessage: (message: string) => void
   ): void {
     let retryCount = 0
     let retryDelay = this.initialRetryDelay
@@ -241,10 +241,10 @@ export class RedisSubscriptionManager {
           logger.info({ channel }, 'Subscriber reconnected')
           
           // Re-subscribe to the channel after reconnection
-          await subscriber.subscribe(channel, (message) => {
+          await subscriber.subscribe(channel, (message: unknown) => {
             try {
-              const data = JSON.parse(message) as unknown
-              onMessage(data)
+              const data = JSON.parse(String(message)) as unknown
+              onMessage(JSON.stringify(data))
             } catch (err) {
               logger.error({ err, message, channel }, 'Failed to parse Redis message on reconnection')
             }

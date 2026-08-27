@@ -28,6 +28,7 @@ on:
 jobs:
   secure_scan_and_report:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: read
@@ -35,6 +36,12 @@ jobs:
       SCANNER_APP_ID: ${{ secrets.SCANNER_APP_ID }}
       SCANNER_APP_PRIVATE_KEY: ${{ secrets.SCANNER_APP_PRIVATE_KEY }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      # Scanner image references. Pin these to immutable digests for supply-chain
+      # hardening once, then bump deliberately:
+      #   docker manifest inspect <image> | jq '.manifests[0].digest'
+      TRUFFLEHOG_IMAGE: trufflesecurity/trufflehog:latest
+      SEMGREP_IMAGE: semgrep/semgrep:latest
+      OSV_SCANNER_IMAGE: gcr.io/osv-v4/osv-scanner:latest
 
     steps:
       - name: Resolve source repository
@@ -45,14 +52,12 @@ jobs:
           if [ -z "$SOURCE_REPO" ]; then
             SOURCE_REPO="${{ github.repository }}"
           fi
-
           OWNER="${SOURCE_REPO%%/*}"
           REPO="${SOURCE_REPO#*/}"
           if [ -z "$OWNER" ] || [ -z "$REPO" ] || [ "$OWNER" = "$SOURCE_REPO" ]; then
             echo "Invalid source repo: $SOURCE_REPO" >&2
             exit 1
           fi
-
           echo "full=$SOURCE_REPO" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
           echo "name=$REPO" >> "$GITHUB_OUTPUT"
@@ -90,254 +95,422 @@ jobs:
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Run TruffleHog
+      # ---------------------------------------------------------------------------
+      # Scanner execution.
+      #
+      # Every scanner step always exits 0 so a finding never aborts the pipeline.
+      # Tool health is tracked separately from findings: each step writes
+      # status=success|error, and finding counts are derived from parsed JSON
+      # in the normalization step below, never from exit codes.
+      # ---------------------------------------------------------------------------
+
+      - name: Run TruffleHog (secrets)
         id: trufflehog
         shell: bash
         run: |
           set +e
-          docker run --rm             -v "$PWD:/repo"             trufflesecurity/trufflehog:latest             filesystem /repo --results=verified,unknown --json > trufflehog-output.json
+          docker run --rm \
+            -v "$PWD:/repo" \
+            "$TRUFFLEHOG_IMAGE" \
+            filesystem /repo --results=verified,unknown --json > trufflehog-output.json 2> trufflehog-stderr.log
           CODE=$?
           set -e
-
-          if [ $CODE -eq 0 ]; then
+          # TruffleHog may exit non-zero when findings are present; findings are
+          # counted from JSON below. Only treat as tool error when no output.
+          if [ -s trufflehog-output.json ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "status=error" >> "$GITHUB_OUTPUT"
           fi
           echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
-          exit 0
 
-      - name: Run Semgrep
+      - name: Run Semgrep (SAST)
         id: semgrep
         shell: bash
         run: |
           set +e
-          docker run --rm             -v "$PWD:/src"             -w /src             semgrep/semgrep:latest             semgrep --config p/security-audit --error --json > semgrep-output.json
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            "$SEMGREP_IMAGE" \
+            semgrep scan \
+              --config p/security-audit \
+              --config p/default \
+              --config p/python \
+              --config p/typescript \
+              --config p/javascript \
+              --json --output /src/semgrep-output.json > semgrep-run.log 2>&1
           CODE=$?
           set -e
-
-          if [ $CODE -eq 0 ]; then
+          # Without --error, a non-zero exit means the tool itself failed.
+          if [ $CODE -eq 0 ] && [ -s semgrep-output.json ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
-            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "status=error" >> "$GITHUB_OUTPUT"
           fi
           echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
-          exit 0
 
-      - name: SecurityLab availability check
-        id: seclab
+      - name: Run osv-scanner (dependency/SCA)
+        id: osv
         shell: bash
         run: |
-          # SecurityLab agent is currently unavailable in runner environment.
-          # Mark status truthfully so report/scoring does not claim full coverage.
-          echo "status=skipped" >> "$GITHUB_OUTPUT"
-          echo "SecurityLab AI analysis skipped: runtime agent unavailable in workflow environment." > seclab-taskflow-output.txt
-          echo "Fallback scanners executed: TruffleHog, Semgrep." >> seclab-taskflow-output.txt
+          set +e
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            "$OSV_SCANNER_IMAGE" \
+            scan --recursive /src --format json --output /src/osv-output.json > osv-run.log 2>&1
+          CODE=$?
+          if [ $CODE -ne 0 ] && [ ! -s osv-output.json ]; then
+            # Older CLI without the scan subcommand.
+            docker run --rm \
+              -v "$PWD:/src" \
+              -w /src \
+              "$OSV_SCANNER_IMAGE" \
+              -r /src --format json --output /src/osv-output.json >> osv-run.log 2>&1
+            CODE=$?
+          fi
+          set -e
+          # osv-scanner exits 1 when vulnerabilities are found; findings are
+          # counted from JSON. Tool error only when no parsable output.
+          if [ -s osv-output.json ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=error" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
 
-      - name: Compile markdown report
+      # ---------------------------------------------------------------------------
+      # Normalization + scoring. Produces:
+      #   findings.json    - normalized, per-finding records (ingested by the
+      #                      orchestrator into scan_findings in Phase 2)
+      #   scan-result.json - aggregate result (schema-compatible with the
+      #                      orchestrator's scanResultArtifactSchema)
+      #   report.md        - human-readable report
+      # ---------------------------------------------------------------------------
+      - name: Normalize findings and compute scores
         if: ${{ always() }}
         shell: bash
+        env:
+          TOOL_TRUFFLEHOG: ${{ steps.trufflehog.outputs.status }}
+          TOOL_SEMGREP: ${{ steps.semgrep.outputs.status }}
+          TOOL_OSV: ${{ steps.osv.outputs.status }}
         run: |
-          TRUFFLEHOG_OUTCOME="${{ steps.trufflehog.outputs.status || 'failure' }}"
-          SEMGREP_OUTCOME="${{ steps.semgrep.outputs.status || 'failure' }}"
-          SECLAB_STATUS="${{ steps.seclab.outputs.status }}"
-          TEMPLATE_VERSION="${{ github.event.inputs.template_version || 'n/a' }}"
-          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha || 'unknown' }}"
+          cat > normalize.py <<'PYEOF'
+          import json
+          import os
+          from collections import Counter
 
-          TRUFFLEHOG_DISPLAY="⚠️ Scan Failed"
-          SEMGREP_DISPLAY="⚠️ Scan Failed"
-          SECLAB_DISPLAY="⚠️ Scan Failed"
+          SEVERITY_ORDER = ["critical", "high", "medium", "low"]
+          MAX_FINDINGS = 500
 
-          if [ "$TRUFFLEHOG_OUTCOME" = "success" ]; then
-            TRUFFLEHOG_DISPLAY="✅ No Findings"
-          elif [ "$TRUFFLEHOG_OUTCOME" = "failure" ]; then
-            TRUFFLEHOG_DISPLAY="🔴 Findings Detected"
-          fi
+          def read_json(path, jsonl=False):
+              if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                  return None
+              try:
+                  if jsonl:
+                      out = []
+                      with open(path) as fh:
+                          for line in fh:
+                              line = line.strip()
+                              if not line:
+                                  continue
+                              try:
+                                  out.append(json.loads(line))
+                              except ValueError:
+                                  pass
+                      return out
+                  with open(path) as fh:
+                      return json.load(fh)
+              except ValueError:
+                  return None
 
-          if [ "$SEMGREP_OUTCOME" = "success" ]; then
-            SEMGREP_DISPLAY="✅ No Findings"
-          elif [ "$SEMGREP_OUTCOME" = "failure" ]; then
-            SEMGREP_DISPLAY="🔴 Findings Detected"
-          fi
+          def clip(text, limit=200):
+              text = (text or "").replace("\n", " ").replace("\r", " ").strip()
+              return text[:limit]
 
-          if [ "$SECLAB_STATUS" = "executed" ]; then
-            SECLAB_DISPLAY="✅ Completed"
-          elif [ "$SECLAB_STATUS" = "skipped" ]; then
-            SECLAB_DISPLAY="⏭️ Skipped (agent unavailable)"
-          elif [ "$SECLAB_STATUS" = "failed" ]; then
-            SECLAB_DISPLAY="⚠️ Execution Failed"
-          fi
+          findings = []
+          tool_errors = []
 
-          TRUFFLEHOG_FINDINGS=0
-          SEMGREP_FINDINGS=0
-          if [ -s trufflehog-output.json ]; then
-            TRUFFLEHOG_FINDINGS=$(jq -s 'length' trufflehog-output.json 2>/dev/null || echo 0)
-          fi
-          if [ -s semgrep-output.json ]; then
-            SEMGREP_FINDINGS=$(jq '.results | length' semgrep-output.json 2>/dev/null || echo 0)
-          fi
-          TOTAL_FINDINGS=$((TRUFFLEHOG_FINDINGS + SEMGREP_FINDINGS))
+          # --- TruffleHog ---
+          th = read_json("trufflehog-output.json", jsonl=True)
+          if os.environ.get("TOOL_TRUFFLEHOG") != "success" or th is None:
+              tool_errors.append("trufflehog")
+          else:
+              seen = set()
+              for r in th:
+                  meta = (r.get("SourceMetadata") or {}).get("Data") or {}
+                  git = meta.get("Git") or {}
+                  fs = meta.get("Filesystem") or meta.get("filesystem") or {}
+                  fpath = git.get("file") or fs.get("file") or fs.get("path") or "unknown"
+                  key = (r.get("DetectorName"), fpath)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  verified = bool(r.get("Verified"))
+                  findings.append({
+                      "tool": "trufflehog",
+                      "category": "secrets",
+                      "severity": "critical" if verified else "medium",
+                      "rule_id": r.get("DetectorName") or "secret",
+                      "title": ("Verified secret: %s" % (r.get("DetectorName") or "unknown")) if verified
+                               else ("Possible secret: %s" % (r.get("DetectorName") or "unknown")),
+                      "file_path": fpath,
+                      "line_start": int(git.get("line") or 0),
+                      "line_end": int(git.get("line") or 0),
+                      "description": "Potential hardcoded credential detected by TruffleHog"
+                                     + (" (live/verified)" if verified else " (unverified match)"),
+                      "evidence": clip(r.get("RawV2") or r.get("Raw") or ""),
+                      "recommendation": "Remove the secret, rotate the credential, and use environment variables or a secrets manager.",
+                  })
 
-          echo "# ${{ github.event.inputs.report_title }}" > report.md
-          echo "" >> report.md
-          echo "- Scan Job ID: ${{ github.event.inputs.scan_job_id }}" >> report.md
-          echo "- Template ID: ${{ github.event.inputs.template_id || 'n/a' }}" >> report.md
-          echo "- Template Version: $TEMPLATE_VERSION" >> report.md
-          echo "- Repository: ${{ steps.source-repo.outputs.full }}" >> report.md
-          echo "- Source Commit: $SOURCE_COMMIT" >> report.md
-          echo "- Run ID: ${{ github.run_id }}" >> report.md
-          echo "- Completed At: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> report.md
-          echo "" >> report.md
-          echo "## Security Tool Results" >> report.md
-          echo "- TruffleHog: $TRUFFLEHOG_DISPLAY" >> report.md
-          echo "- Semgrep: $SEMGREP_DISPLAY" >> report.md
-          echo "- SecurityLab Taskflow Agent: $SECLAB_DISPLAY" >> report.md
-          echo "- Findings: TruffleHog=$TRUFFLEHOG_FINDINGS, Semgrep=$SEMGREP_FINDINGS, Total=$TOTAL_FINDINGS" >> report.md
-          echo "" >> report.md
+          # --- Semgrep ---
+          sg = read_json("semgrep-output.json")
+          if os.environ.get("TOOL_SEMGREP") != "success" or not isinstance(sg, dict):
+              tool_errors.append("semgrep")
+          else:
+              sev_map = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+              for r in sg.get("results") or []:
+                  extra = r.get("extra") or {}
+                  findings.append({
+                      "tool": "semgrep",
+                      "category": "sast",
+                      "severity": sev_map.get((extra.get("severity") or "").upper(), "low"),
+                      "rule_id": r.get("check_id") or "semgrep-rule",
+                      "title": clip(extra.get("message") or r.get("check_id") or "semgrep finding", 160),
+                      "file_path": r.get("path") or "unknown",
+                      "line_start": int((r.get("start") or {}).get("line") or 0),
+                      "line_end": int((r.get("end") or {}).get("line") or 0),
+                      "description": clip(extra.get("message") or ""),
+                      "evidence": clip(extra.get("lines") or ""),
+                      "recommendation": clip(extra.get("fix") or "Review the flagged code path and remediate per the rule guidance.", 200),
+                  })
 
-          echo "## Findings Snapshot" >> report.md
-          if [ "$TOTAL_FINDINGS" -eq 0 ]; then
-            echo "- No findings detected by TruffleHog or Semgrep." >> report.md
-          else
-            if [ "$TRUFFLEHOG_FINDINGS" -gt 0 ]; then
-              echo "### TruffleHog Findings (top 5)" >> report.md
-              jq -r -s '.[:5][] | "- [(.DetectorName // "Secret")] (.SourceMetadata.Data.Git.file // "unknown file")"' trufflehog-output.json 2>/dev/null >> report.md || true
-            fi
-            if [ "$SEMGREP_FINDINGS" -gt 0 ]; then
-              echo "### Semgrep Findings (top 5)" >> report.md
-              jq -r '.results[:5][] | "- [(.extra.severity // "INFO")] (.check_id // "rule") at (.path // "unknown"):(.start.line // 0)"' semgrep-output.json 2>/dev/null >> report.md || true
-            fi
-          fi
+          # --- osv-scanner ---
+          osv = read_json("osv-output.json")
+          if os.environ.get("TOOL_OSV") != "success" or not isinstance(osv, dict):
+              tool_errors.append("osv-scanner")
+          else:
+              def osv_severity(vuln):
+                  ds = (vuln.get("database_specific") or {}).get("severity")
+                  if isinstance(ds, str):
+                      s = ds.upper()
+                      if "CRIT" in s: return "critical"
+                      if s == "HIGH": return "high"
+                      if "MODERATE" in s or s == "MEDIUM": return "medium"
+                      if s == "LOW": return "low"
+                  for vec in vuln.get("severity") or []:
+                      vector = vec.get("score") or ""
+                      if vector.startswith("CVSS"):
+                          try:
+                              parts = dict(p.split(":", 1) for p in vector.split("/") if ":" in p)
+                              base = 0.0
+                              weights = {"AV": 0.4, "AC": 0.1, "PR": 0.2, "C": 0.15, "I": 0.1, "A": 0.05}
+                              impact = {"C": 1.0, "H": 0.6, "L": 0.2}
+                              for k, w in weights.items():
+                                  base += w * impact.get(parts.get(k, "L"), 0.2)
+                              score = base * 10
+                              if score >= 9: return "critical"
+                              if score >= 7: return "high"
+                              if score >= 4: return "medium"
+                              return "low"
+                          except Exception:
+                              pass
+                  return "medium"
 
-          if [ -f seclab-taskflow-output.txt ]; then
-            echo "" >> report.md
-            echo "### SecurityLab Taskflow Agent Output (excerpt)" >> report.md
-            echo '```text' >> report.md
-            head -n 80 seclab-taskflow-output.txt >> report.md
-            echo '```' >> report.md
-          fi
+              for res in osv.get("results") or []:
+                  src = res.get("source") or {}
+                  spath = src.get("path") or "unknown"
+                  for pkg in res.get("packages") or []:
+                      pinfo = pkg.get("package") or {}
+                      pname = "%s@%s" % (pinfo.get("name", "unknown"), pinfo.get("version", "?"))
+                      for vuln in pkg.get("vulnerabilities") or []:
+                          aliases = vuln.get("aliases") or []
+                          vuln_id = vuln.get("id") or (aliases[0] if aliases else "OSV")
+                          findings.append({
+                              "tool": "osv-scanner",
+                              "category": "dependencies",
+                              "severity": osv_severity(vuln),
+                              "rule_id": vuln_id,
+                              "title": "Vulnerable dependency %s (%s)" % (pname, vuln_id),
+                              "file_path": spath,
+                              "line_start": 0,
+                              "line_end": 0,
+                              "description": clip(vuln.get("summary") or vuln.get("details") or "Known vulnerability in a dependency", 300),
+                              "evidence": pname,
+                              "recommendation": "Upgrade %s to a fixed version. See %s" % (pname, vuln.get("id") or "OSV database"),
+                          })
 
-      - name: Build machine-readable scan result
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          TRUFFLEHOG_STATUS="${{ steps.trufflehog.outputs.status || 'failure' }}"
-          SEMGREP_STATUS="${{ steps.semgrep.outputs.status || 'failure' }}"
-          SECLAB_STATUS="${{ steps.seclab.outputs.status }}"
-          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha || '' }}"
-          TEMPLATE_VERSION="${{ github.event.inputs.template_version || '' }}"
+          # Cap total findings to bound artifact size.
+          findings = findings[:MAX_FINDINGS]
 
-          SECRETS_RATING="A"
-          SAST_RATING="A"
-          PROMPT_INJECTION_RATING="A"
-          DEPENDENCIES_RATING="A"
-          PERMISSIONS_RATING="A"
+          counts = Counter(f["severity"] for f in findings)
+          cat_counts = {}
+          for f in findings:
+              cat_counts.setdefault(f["category"], Counter())[f["severity"]] += 1
+          error_cats = {}
+          for err in tool_errors:
+              cat = {"trufflehog": "secrets", "semgrep": "sast", "osv-scanner": "dependencies"}[err]
+              error_cats[cat] = err
+              cat_counts.setdefault(cat, Counter())["high"] += 1
+              counts["high"] += 1
 
-          OVERALL_RATING="A"
-          OVERALL_SCORE=95
-          RISK_LEVEL="none"
+          def rating_for(c):
+              score = 100 - 25 * c.get("critical", 0) - 10 * c.get("high", 0) \
+                      - 3 * c.get("medium", 0) - 1 * c.get("low", 0)
+              score = max(0, min(100, score))
+              if score >= 90: return score, "A"
+              if score >= 75: return score, "B"
+              if score >= 60: return score, "C"
+              if score >= 40: return score, "D"
+              return score, "F"
 
-          HIGH_COUNT=0
-          MEDIUM_COUNT=0
-          CRITICAL_COUNT=0
-          COVERAGE_NOTE="Full tool coverage."
+          RANK = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+          LETTERS = ["A", "B", "C", "D", "F"]
 
-          if [ "$TRUFFLEHOG_STATUS" != "success" ]; then
-            SECRETS_RATING="C"
-            HIGH_COUNT=$((HIGH_COUNT + 1))
-          fi
+          def worse(a, b):
+              return a if RANK[a] >= RANK[b] else b
 
-          if [ "$SEMGREP_STATUS" != "success" ]; then
-            SAST_RATING="C"
-            HIGH_COUNT=$((HIGH_COUNT + 1))
-          fi
+          overall_score, overall_rating = rating_for(counts)
+          if tool_errors:
+              # An unverifiable scan must never rate better than C.
+              overall_rating = worse(overall_rating, "C")
+          if counts.get("critical"): risk = "critical"
+          elif counts.get("high"): risk = "high"
+          elif counts.get("medium"): risk = "medium"
+          elif counts.get("low"): risk = "low"
+          else: risk = "none"
 
-          if [ "$SECLAB_STATUS" = "skipped" ]; then
-            PROMPT_INJECTION_RATING="B"
-            DEPENDENCIES_RATING="B"
-            PERMISSIONS_RATING="B"
-            MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
-            COVERAGE_NOTE="SecurityLab skipped; AI-assisted checks unavailable in this run."
-          elif [ "$SECLAB_STATUS" != "executed" ]; then
-            PROMPT_INJECTION_RATING="C"
-            DEPENDENCIES_RATING="C"
-            PERMISSIONS_RATING="C"
-            HIGH_COUNT=$((HIGH_COUNT + 1))
-            COVERAGE_NOTE="SecurityLab failed to execute."
-          elif [ -f seclab-taskflow-output.txt ]; then
-            if grep -Eiq '(critical|remote code execution|token exfiltration|privilege escalation)' seclab-taskflow-output.txt; then
-              PROMPT_INJECTION_RATING="C"
-              DEPENDENCIES_RATING="C"
-              PERMISSIONS_RATING="C"
-              CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
-            elif grep -Eiq '(high|command injection|sql injection|supply chain|dependency confusion)' seclab-taskflow-output.txt; then
-              PROMPT_INJECTION_RATING="C"
-              DEPENDENCIES_RATING="C"
-              PERMISSIONS_RATING="C"
-              HIGH_COUNT=$((HIGH_COUNT + 1))
-            elif grep -Eiq '(medium|moderate|unsafe default|weak validation)' seclab-taskflow-output.txt; then
-              PROMPT_INJECTION_RATING="B"
-              DEPENDENCIES_RATING="B"
-              PERMISSIONS_RATING="B"
-              MEDIUM_COUNT=$((MEDIUM_COUNT + 1))
-            fi
-          fi
+          cat_ratings = {}
+          for cat in ["secrets", "sast", "dependencies"]:
+              _, letter = rating_for(cat_counts.get(cat, Counter()))
+              if cat in error_cats:
+                  # Scanner error: coverage unknown, never better than C.
+                  letter = worse(letter, "C")
+              cat_ratings[cat] = letter
+          # Not yet implemented analyzers; disclosed in summary. B = partial
+          # coverage, deliberately publishable so the gate is not distorted.
+          cat_ratings["promptInjection"] = "B"
+          cat_ratings["permissions"] = "B"
 
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            OVERALL_RATING="C"
-            OVERALL_SCORE=58
-            RISK_LEVEL="high"
-          elif [ "$HIGH_COUNT" -gt 0 ]; then
-            OVERALL_RATING="C"
-            OVERALL_SCORE=66
-            RISK_LEVEL="medium"
-          elif [ "$MEDIUM_COUNT" -gt 0 ]; then
-            OVERALL_RATING="B"
-            OVERALL_SCORE=84
-            RISK_LEVEL="low"
-          else
-            OVERALL_RATING="A"
-            OVERALL_SCORE=95
-            RISK_LEVEL="none"
-          fi
+          coverage = []
+          if tool_errors:
+              coverage.append("Tool errors: %s (treated as high-severity gaps)." % ", ".join(tool_errors))
+          coverage.append("Prompt-injection and permissions analyzers are not yet enabled; those ratings are placeholders.")
 
-          cat > scan-result.json <<EOF_JSON
-          {
-            "overallRating": "$OVERALL_RATING",
-            "overallScore": $OVERALL_SCORE,
-            "riskLevel": "$RISK_LEVEL",
-            "sourceCommitSha": "$SOURCE_COMMIT",
-            "templateVersion": "$TEMPLATE_VERSION",
-            "severityCounts": {
-              "low": 0,
-              "medium": $MEDIUM_COUNT,
-              "high": $HIGH_COUNT,
-              "critical": $CRITICAL_COUNT
-            },
-            "categoryRatings": {
-              "secrets": "$SECRETS_RATING",
-              "promptInjection": "$PROMPT_INJECTION_RATING",
-              "dependencies": "$DEPENDENCIES_RATING",
-              "permissions": "$PERMISSIONS_RATING",
-              "sast": "$SAST_RATING"
-            },
-            "summary": "Automated workflow scan completed. $COVERAGE_NOTE",
-            "recommendations": [
-              "Review workflow logs and repository findings in detail.",
-              "If SecurityLab is unavailable, use this report as baseline and run supplemental manual review.",
-              "Address any non-success tool outcomes before publishing."
-            ]
+          recs = []
+          if counts.get("critical") or counts.get("high"):
+              recs.append("Fix critical and high severity findings before publishing.")
+          if cat_counts.get("secrets"):
+              recs.append("Remove and rotate any exposed credentials; never commit secrets.")
+          if cat_counts.get("dependencies"):
+              recs.append("Upgrade vulnerable dependencies to fixed versions.")
+          if cat_counts.get("sast"):
+              recs.append("Review static-analysis findings and remediate per rule guidance.")
+          if tool_errors:
+              recs.append("Re-run the scan: one or more scanners failed to produce output.")
+          if not recs:
+              recs.append("No findings detected by the enabled scanners. Continue monitoring on each template version.")
+
+          meta = {
+              "scan_job_id": os.environ.get("SCAN_JOB_ID", ""),
+              "template_id": os.environ.get("TEMPLATE_ID", ""),
+              "template_version": os.environ.get("TEMPLATE_VERSION", ""),
+              "repo": os.environ.get("SOURCE_REPO", ""),
+              "commit": os.environ.get("SOURCE_COMMIT", ""),
+              "run_id": os.environ.get("RUN_ID", ""),
           }
-          EOF_JSON
 
-          {
-            echo ""
-            echo "## Overall Result"
-            echo "- Overall Rating: $OVERALL_RATING"
-            echo "- Overall Score: $OVERALL_SCORE/100"
-            echo "- Risk Level: $RISK_LEVEL"
-            echo "- Coverage Note: $COVERAGE_NOTE"
-          } >> report.md
+          with open("findings.json", "w") as fh:
+              json.dump({"metadata": meta, "toolErrors": tool_errors, "findings": findings}, fh, indent=2)
+
+          scan_result = {
+              "overallRating": overall_rating,
+              "overallScore": overall_score,
+              "riskLevel": risk,
+              "sourceCommitSha": meta["commit"],
+              "templateVersion": meta["template_version"],
+              "severityCounts": {
+                  "low": counts.get("low", 0),
+                  "medium": counts.get("medium", 0),
+                  "high": counts.get("high", 0),
+                  "critical": counts.get("critical", 0),
+              },
+              "categoryRatings": {
+                  "secrets": cat_ratings["secrets"],
+                  "promptInjection": cat_ratings["promptInjection"],
+                  "dependencies": cat_ratings["dependencies"],
+                  "permissions": cat_ratings["permissions"],
+                  "sast": cat_ratings["sast"],
+              },
+              "summary": "Scan completed with TruffleHog, Semgrep and osv-scanner. %d findings. %s"
+                         % (len(findings), " ".join(coverage)),
+              "recommendations": recs,
+          }
+          with open("scan-result.json", "w") as fh:
+              json.dump(scan_result, fh, indent=2)
+
+          # --- report.md ---
+          lines = []
+          lines.append("# %s" % os.environ.get("REPORT_TITLE", "Security Scan Report"))
+          lines.append("")
+          lines.append("- Scan Job ID: %s" % (meta["scan_job_id"] or "n/a"))
+          lines.append("- Template ID: %s" % (meta["template_id"] or "n/a"))
+          lines.append("- Template Version: %s" % (meta["template_version"] or "n/a"))
+          lines.append("- Repository: %s" % (meta["repo"] or "n/a"))
+          lines.append("- Source Commit: %s" % (meta["commit"] or "unknown"))
+          lines.append("- Run ID: %s" % (meta["run_id"] or "n/a"))
+          lines.append("")
+          lines.append("## Overall Result")
+          lines.append("- Overall Rating: %s (%d/100)" % (overall_rating, overall_score))
+          lines.append("- Risk Level: %s" % risk)
+          lines.append("- Findings: critical=%d high=%d medium=%d low=%d (total=%d)"
+                       % (counts.get("critical", 0), counts.get("high", 0),
+                          counts.get("medium", 0), counts.get("low", 0), len(findings)))
+          lines.append("- Category ratings: secrets=%s sast=%s dependencies=%s promptInjection=%s(B placeholder) permissions=%s(B placeholder)"
+                       % (cat_ratings["secrets"], cat_ratings["sast"], cat_ratings["dependencies"],
+                          cat_ratings["promptInjection"], cat_ratings["permissions"]))
+          if tool_errors:
+              lines.append("- Tool errors: %s" % ", ".join(tool_errors))
+          lines.append("")
+          lines.append("## Scanners Executed")
+          lines.append("- TruffleHog (secrets): %s" % ("error" if "trufflehog" in tool_errors else "ok"))
+          lines.append("- Semgrep p/security-audit,p/default,p/python,p/typescript,p/javascript (SAST): %s" % ("error" if "semgrep" in tool_errors else "ok"))
+          lines.append("- osv-scanner (dependencies): %s" % ("error" if "osv-scanner" in tool_errors else "ok"))
+          lines.append("- Prompt-injection / permissions analyzers: not yet implemented")
+          lines.append("")
+          if findings:
+              lines.append("## Findings")
+              lines.append("")
+              sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+              for f in sorted(findings, key=lambda x: sev_rank.get(x["severity"], 9))[:20]:
+                  loc = f["file_path"]
+                  if f["line_start"]:
+                      loc += ":%d" % f["line_start"]
+                  lines.append("- **[%s] %s** (%s / %s) - %s" % (f["severity"].upper(), f["rule_id"], f["tool"], loc, f["title"]))
+              if len(findings) > 20:
+                  lines.append("- ... and %d more (see findings.json artifact)" % (len(findings) - 20))
+          else:
+              lines.append("## Findings")
+              lines.append("")
+              lines.append("- No findings detected by the enabled scanners.")
+          lines.append("")
+          lines.append("## Recommendations")
+          for r in recs:
+              lines.append("- %s" % r)
+          with open("report.md", "w") as fh:
+              fh.write("\n".join(lines) + "\n")
+
+          print("normalized %d findings; tool errors: %s" % (len(findings), tool_errors or "none"))
+          PYEOF
+          SCAN_JOB_ID="${{ github.event.inputs.scan_job_id }}" \
+          TEMPLATE_ID="${{ github.event.inputs.template_id }}" \
+          TEMPLATE_VERSION="${{ github.event.inputs.template_version }}" \
+          REPORT_TITLE="${{ github.event.inputs.report_title }}" \
+          SOURCE_REPO="${{ steps.source-repo.outputs.full }}" \
+          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha }}" \
+          RUN_ID="${{ github.run_id }}" \
+          python3 normalize.py
 
       - name: Install PDF tooling
         if: ${{ always() }}
@@ -351,8 +524,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p pdf_output
-          if ! pandoc report.md -o pdf_output/report.pdf --pdf-engine=wkhtmltopdf; then
-            printf '%s\n' '<html><body><h1>Scan Report</h1><p>Primary markdown to PDF conversion failed. See artifacts for details.</p></body></html>' > pdf_output/fallback.html
+          if [ -f report.md ]; then
+            if ! pandoc report.md -o pdf_output/report.pdf --pdf-engine=wkhtmltopdf; then
+              printf '%s\n' '<html><body><h1>Scan Report</h1><p>Primary markdown to PDF conversion failed. See artifacts for details.</p></body></html>' > pdf_output/fallback.html
+              wkhtmltopdf pdf_output/fallback.html pdf_output/report.pdf
+            fi
+          else
+            printf '%s\n' '<html><body><h1>Scan Report</h1><p>Report generation failed. See scan-result.json artifact.</p></body></html>' > pdf_output/fallback.html
             wkhtmltopdf pdf_output/fallback.html pdf_output/report.pdf
           fi
 
@@ -364,8 +542,9 @@ jobs:
           path: |
             pdf_output/report.pdf
             scan-result.json
-            seclab-taskflow-output.txt
+            findings.json
             trufflehog-output.json
             semgrep-output.json
+            osv-output.json
           retention-days: 7
           if-no-files-found: warn

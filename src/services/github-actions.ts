@@ -802,6 +802,7 @@ export async function downloadScanArtifacts(
   pdfBuffer?: Buffer;
   resultArtifactName?: string;
   resultJson?: string;
+  findingsJson?: string;
 }> {
   const env = getEnv();
   const preferredReportArtifactName = env.GITHUB_SCAN_ARTIFACT_NAME.trim().toLowerCase();
@@ -830,6 +831,7 @@ export async function downloadScanArtifacts(
   let reportArtifactName: string | undefined;
   let resultJson: string | undefined;
   let resultArtifactName: string | undefined;
+  let findingsJson: string | undefined;
 
   for (const artifact of orderedArtifacts) {
     const response = await fetch(artifact.archive_download_url, {
@@ -870,6 +872,17 @@ export async function downloadScanArtifacts(
       }
     }
 
+    if (!findingsJson) {
+      const findingsEntry = entries.find((entry: AdmZip.IZipEntry) => {
+        const normalized = entry.entryName.toLowerCase();
+        const baseName = normalized.split("/").at(-1) || normalized;
+        return baseName === "findings.json";
+      });
+      if (findingsEntry) {
+        findingsJson = findingsEntry.getData().toString("utf8");
+      }
+    }
+
     if (pdfBuffer && resultJson) {
       break;
     }
@@ -880,6 +893,7 @@ export async function downloadScanArtifacts(
     pdfBuffer,
     resultArtifactName,
     resultJson,
+    findingsJson,
   };
 }
 

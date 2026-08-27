@@ -41,7 +41,7 @@ interface ScanJobRecord {
 export interface ScanJobEntity extends ScanJobRecord {
     id: string | number;
 }
-interface ScanFindingRecord {
+export interface ScanFindingRecord {
     scan_job_id: string;
     severity: ScanSeverity;
     category: ScanCategory | string;

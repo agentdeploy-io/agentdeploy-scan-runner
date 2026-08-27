@@ -3,7 +3,7 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { authMiddleware } from "../middleware/auth.js";
 import { rateLimitMiddleware } from "../middleware/rate-limit.js";
-import { appendScanJobEvent, createScanJob, getScanJob, getScanJobByGitHubRunId, isScanJobEventsLedgerAvailable, listAllActiveScanJobs, listActiveScanJobsForSeller, refreshScanJobEventsLedgerAvailability, updateTemplateScanFields, updateScanJob, uploadScanReportPdf, } from "../services/directus.js";
+import { appendScanJobEvent, createScanFindings, createScanJob, getScanJob, getScanJobByGitHubRunId, isScanJobEventsLedgerAvailable, listAllActiveScanJobs, listActiveScanJobsForSeller, refreshScanJobEventsLedgerAvailability, updateTemplateScanFields, updateScanJob, uploadScanReportPdf, } from "../services/directus.js";
 import { logger } from "../logger.js";
 import { getScanState, publishScanProgress } from "../services/redis.js";
 import { admitTemplateScan, bindTemplateScanJob, clearTemplateBindingIfMatches, getActiveTemplateIds, releaseTemplateScanSlot, } from "../services/scan-concurrency.js";
@@ -78,6 +78,80 @@ const scanResultArtifactSchema = z.object({
     summary: z.string().default(""),
     recommendations: z.array(z.string()).default([]),
 });
+// Normalized findings artifact produced by the scan workflow (findings.json).
+const scanFindingsArtifactSchema = z.object({
+    metadata: z.record(z.unknown()).optional(),
+    toolErrors: z.array(z.string()).optional(),
+    findings: z
+        .array(z.object({
+        tool: z.string().default("unknown"),
+        category: z.string().default("sast"),
+        severity: z.enum(["low", "medium", "high", "critical"]),
+        rule_id: z.string().default("unknown"),
+        file_path: z.string().optional(),
+        line_start: z.number().int().nonnegative().optional(),
+        line_end: z.number().int().nonnegative().optional(),
+        title: z.string().default(""),
+        description: z.string().default(""),
+        evidence: z.string().optional(),
+        recommendation: z.string().optional(),
+    }))
+        .default([]),
+});
+const FINDINGS_TEXT_LIMIT = 1000;
+const FINDINGS_CHUNK_SIZE = 100;
+function clipFindingText(value, limit = FINDINGS_TEXT_LIMIT) {
+    const text = (value || "").replace(/\s+/g, " ").trim();
+    return text.slice(0, limit);
+}
+/**
+ * Persists normalized findings from the findings.json workflow artifact into
+ * the scan_findings collection. Non-fatal: a missing/unparsable artifact or a
+ * Directus write failure logs a warning but never fails the scan job.
+ * Returns the number of findings persisted.
+ */
+async function persistScanFindingsFromArtifact(scanJobId, findingsJson) {
+    if (!findingsJson) {
+        logger.info({ scanJobId }, "No findings.json artifact present; skipping findings ingestion");
+        return 0;
+    }
+    let parsed;
+    try {
+        parsed = scanFindingsArtifactSchema.parse(JSON.parse(findingsJson));
+    }
+    catch (error) {
+        logger.warn({ scanJobId, error: error instanceof Error ? error.message : String(error) }, "findings.json artifact failed validation; skipping findings ingestion");
+        return 0;
+    }
+    const records = parsed.findings.map((finding) => ({
+        scan_job_id: scanJobId,
+        severity: finding.severity,
+        category: finding.category,
+        tool: finding.tool,
+        rule_id: finding.rule_id,
+        file_path: finding.file_path,
+        line_start: finding.line_start,
+        line_end: finding.line_end,
+        title: clipFindingText(finding.title, 300),
+        description: clipFindingText(finding.description),
+        recommendation: clipFindingText(finding.recommendation),
+        evidence: finding.evidence
+            ? { text: clipFindingText(finding.evidence) }
+            : undefined,
+        status: "open",
+    }));
+    try {
+        for (let i = 0; i < records.length; i += FINDINGS_CHUNK_SIZE) {
+            await createScanFindings(records.slice(i, i + FINDINGS_CHUNK_SIZE));
+        }
+        logger.info({ scanJobId, count: records.length }, "Scan findings persisted");
+        return records.length;
+    }
+    catch (error) {
+        logger.error({ scanJobId, error: error instanceof Error ? error.message : String(error) }, "Failed to persist scan findings (non-fatal)");
+        return 0;
+    }
+}
 export const scanRoute = new Hono();
 const ACTIVE_SCAN_STATUSES = new Set([
     "pending",
@@ -281,6 +355,7 @@ async function finalizeSuccessfulGitHubRun(job, githubRunId, githubRunAttempt, w
             ? "completed"
             : "review_required";
         const templateScanStatus = isPublishableRating(overallRating) ? "clean" : "review_required";
+        const findingsPersisted = await persistScanFindingsFromArtifact(String(job.id), artifacts.findingsJson);
         const completedAt = new Date().toISOString();
         const reportFileName = `security-report-${job.id}.pdf`;
         const uploaded = await uploadScanReportPdf(String(job.id), reportFileName, artifacts.pdfBuffer);
@@ -312,6 +387,7 @@ async function finalizeSuccessfulGitHubRun(job, githubRunId, githubRunAttempt, w
                     githubRunId,
                     severityCounts: parsedResult.severityCounts,
                     scanResultArtifactName: artifacts.resultArtifactName,
+                    findingsPersisted,
                 },
             },
             eventData: {
