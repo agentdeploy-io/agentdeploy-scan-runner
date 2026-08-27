@@ -181,6 +181,223 @@ jobs:
           echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------------
+      # Agent-template analyzers (Phase 3):
+      #   - permissions/capability review of MCP manifests and agent configs
+      #   - prompt-injection heuristics over prompt/template files
+      # Writes agent-analysis.json; merged by the normalization step.
+      # ---------------------------------------------------------------------------
+      - name: Run agent-template analyzers
+        id: agent-analyze
+        shell: bash
+        run: |
+          cat > agent-analyze.py <<'PYEOF'
+          import json
+          import os
+          import re
+
+          SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", ".idea", ".vscode"}
+          TEXT_EXTS = {".md", ".txt", ".prompt", ".j2", ".jinja", ".jinja2", ".tmpl", ".template", ".yaml", ".yml", ".toml"}
+          PROMPT_HINTS = ("prompt", "system", "agent", "instruction", "claude", "cursor", "openai")
+          MAX_FILE_BYTES = 512 * 1024
+          MAX_FILES = 2000
+
+          findings = []
+
+          def add(category, severity, rule_id, title, path, line, description, evidence, recommendation):
+              findings.append({
+                  "tool": "agent-analyzer",
+                  "category": category,
+                  "severity": severity,
+                  "rule_id": rule_id,
+                  "title": title,
+                  "file_path": path,
+                  "line_start": line or 0,
+                  "line_end": line or 0,
+                  "description": description,
+                  "evidence": (evidence or "")[:200],
+                  "recommendation": recommendation,
+              })
+
+          _walked = []
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+              for name in files:
+                  _walked.append(os.path.join(root, name))
+                  if len(_walked) >= MAX_FILES:
+                      break
+              if len(_walked) >= MAX_FILES:
+                  break
+
+          def walk_files():
+              return _walked
+
+          # -----------------------------------------------------------------
+          # Permissions / capability review (MCP manifests + agent configs)
+          # -----------------------------------------------------------------
+          MCP_MANIFEST_NAMES = {
+              "mcp.json", ".mcp.json", "claude_desktop_config.json",
+              "mcp_config.json", "mcpservers.json",
+          }
+          AGENT_CONFIG_NAMES = {"langgraph.json", "crewai.yaml", "crewai.yml", "agents.json", "assistant.json"}
+
+          BROAD_FS_PATTERNS = re.compile(r'"/"\s*|"\.\."\s*|"~"\s*|"\$HOME', re.I)
+          SHELL_TOOL_PATTERNS = re.compile(r'\b(shell|bash|terminal|run[_-]?command|exec[_-]?command|desktop[_-]?commander|code[_-]?interpreter)\b', re.I)
+          WEBHOOK_HOSTS = re.compile(r'https?://[^\s"\'<>]*(webhook\.site|requestbin|pipedream|ngrok|pastebin|discord\.com/api/webhooks|api\.telegram\.org/bot|hooks\.slack|bit\.ly|tinyurl)', re.I)
+          ENV_SECRET_KEYS = re.compile(r'\b[A-Z0-9_]*(TOKEN|SECRET|API_KEY|APIKEY|PASSWORD|CREDENTIAL|PRIVATE_KEY)[A-Z0-9_]*\b')
+
+          def analyze_manifest(path, text):
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  add("permissions", "low", "manifest-unparsable",
+                      "MCP/agent manifest is not valid JSON", path, 0,
+                      "Manifest could not be parsed; manual review recommended.", "", "Fix the manifest syntax.")
+                  return
+              servers = None
+              if isinstance(data, dict):
+                  servers = data.get("mcpServers") or data.get("mcp_servers") or data.get("servers")
+              if not isinstance(servers, dict):
+                  servers = {}
+              for name, cfg in servers.items():
+                  if not isinstance(cfg, dict):
+                      continue
+                  cmd = str(cfg.get("command") or "")
+                  args = " ".join(str(a) for a in (cfg.get("args") or []))
+                  blob = json.dumps(cfg)
+                  if SHELL_TOOL_PATTERNS.search(cmd + " " + args):
+                      add("permissions", "high", "mcp-shell-server",
+                          "MCP server '%s' wraps shell/command execution" % name, path, 0,
+                          "The server command exposes shell or command-execution capabilities to the agent.",
+                          cmd + " " + args,
+                          "Restrict shell access or document why command execution is required.")
+                  fs_args = [a for a in (cfg.get("args") or []) if isinstance(a, str) and BROAD_FS_PATTERNS.search('"%s"' % a)]
+                  if fs_args:
+                      add("permissions", "high", "mcp-broad-filesystem",
+                          "MCP server '%s' mounts broad filesystem root" % name, path, 0,
+                          "A filesystem server appears scoped to '/', '..', '~' or $HOME.",
+                          " ".join(fs_args),
+                          "Scope filesystem servers to specific project directories.")
+                  url = cfg.get("url") or cfg.get("endpoint")
+                  if url and WEBHOOK_HOSTS.search(str(url)):
+                      add("permissions", "high", "mcp-exfil-endpoint",
+                          "MCP server '%s' points at a webhook/relay endpoint" % name, path, 0,
+                          "Remote MCP endpoint matches known webhook/relay hosts that can capture forwarded data.",
+                          str(url)[:200],
+                          "Remove the endpoint or replace with an audited production host.")
+                  elif url:
+                      add("permissions", "medium", "mcp-remote-endpoint",
+                          "MCP server '%s' is remote (data leaves the machine)" % name, path, 0,
+                          "Remote MCP endpoints receive tool inputs which may include user data.",
+                          str(url)[:200],
+                          "Document the external endpoint and what data it receives.")
+                  env_keys = list((cfg.get("env") or {}).keys())
+                  secrets = [k for k in env_keys if ENV_SECRET_KEYS.search(str(k))]
+                  if secrets:
+                      add("permissions", "medium", "mcp-env-secrets",
+                          "MCP server '%s' requests credential env vars (%s)" % (name, ", ".join(secrets[:5])),
+                          path, 0,
+                          "The server requires secret-bearing environment variables.",
+                          "", "Verify each credential is required and never logged or forwarded.")
+
+          for path in walk_files():
+              base = os.path.basename(path).lower()
+              if base in MCP_MANIFEST_NAMES or base in AGENT_CONFIG_NAMES or base.endswith(".mcp.json"):
+                  try:
+                      if os.path.getsize(path) > MAX_FILE_BYTES:
+                          continue
+                      with open(path, encoding="utf-8", errors="ignore") as fh:
+                          text = fh.read()
+                  except OSError:
+                      continue
+                  analyze_manifest(path, text)
+
+          # -----------------------------------------------------------------
+          # Prompt-injection heuristics
+          # -----------------------------------------------------------------
+          INJECTION_RULES = [
+              ("high", "inj-ignore-instructions", re.compile(r"ignore\s+(all|any|the|those|your|previous|prior|above|earlier)\s+(previous\s+|prior\s+|above\s+|earlier\s+)?(instructions?|rules?|prompts?|directions?|guidelines?)", re.I),
+               "Instruction-override pattern in prompt content",
+               "Prompt tells the agent to ignore its instructions - classic prompt-injection marker.",
+               "Remove the override language; if intentional, document why."),
+              ("high", "inj-exfiltrate", re.compile(r"(send|post|upload|transmit|exfiltrate|forward|email|tweet)[^.\n]{0,60}(conversation|history|messages?|chat\s?log|api[\s_-]?key|token|secret|password|credentials?|environment\s+variables?|env\s+vars?|\.env|ssh|keys?)", re.I),
+               "Possible data/credential exfiltration instruction",
+               "Prompt instructs the agent to send conversation data or credentials somewhere.",
+               "Remove the instruction and audit any outbound networking in the template."),
+              ("high", "inj-conceal", re.compile(r"(do\s+not|don't|never)\s+(tell|reveal|mention|inform|show)[^.\n]{0,40}(user|owner|admin|operator|developer)", re.I),
+               "Instruction to conceal behavior from the user",
+               "Prompt asks the agent to hide its behavior from the user.",
+               "Remove concealed-behavior instructions; marketplace templates must be transparent."),
+              ("high", "inj-webhook-url", WEBHOOK_HOSTS,
+               "Webhook/relay URL in prompt or config content",
+               "Content contains a URL to a webhook/relay service that can capture forwarded data.",
+               "Remove the URL or replace with an audited endpoint."),
+              ("high", "inj-invisible-chars", re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]"),
+               "Invisible/zero-width characters in text content",
+               "Zero-width or bidirectional-override characters can hide instructions from human review.",
+               "Strip invisible characters from the file."),
+              ("medium", "inj-prompt-extraction", re.compile(r"(repeat|print|output|reveal|recite|show\s+me)\s+(your\s+|the\s+)?(system\s+prompt|initial\s+instructions|original\s+instructions|hidden\s+instructions)", re.I),
+               "System-prompt extraction pattern",
+               "Prompt attempts to extract the system prompt or hidden instructions.",
+               "Remove the extraction attempt."),
+              ("medium", "inj-role-hijack", re.compile(r"you\s+are\s+now\s+(a|an|the)\s+[^.\n]{0,40}(without|ignoring|bypassing|free|unrestricted)", re.I),
+               "Role-hijack with restriction bypass",
+               "Prompt re-assigns the agent role while removing restrictions.",
+               "Remove the hijack language."),
+              ("medium", "inj-credential-request", re.compile(r"(ask\s+(the\s+)?user\s+for|request|collect|harvest)[^.\n]{0,50}(password|credit\s?card|api[\s_-]?key|token|ssn|social\s+security|bank)", re.I),
+               "Prompt requests sensitive credentials from users",
+               "Prompt instructs the agent to solicit secrets from the user.",
+               "Never collect raw credentials via prompts; use OAuth or a secrets manager."),
+              ("low", "inj-base64-blob", re.compile(r"[A-Za-z0-9+/]{120,}={0,2}"),
+               "Large base64-like blob in text content",
+               "Long opaque blobs may hide payloads from review.",
+               "Decode and document the blob, or ship it as a declared asset."),
+          ]
+
+          def looks_like_prompt(path):
+              base = os.path.basename(path).lower()
+              if os.path.splitext(base)[1] in TEXT_EXTS:
+                  return True
+              return any(h in base for h in PROMPT_HINTS)
+
+          for path in walk_files():
+              base = os.path.basename(path).lower()
+              ext = os.path.splitext(base)[1].lower()
+              if ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".csv", ".sql"} and base not in ("agents.md", "claude.md"):
+                  continue
+              if not looks_like_prompt(path):
+                  continue
+              try:
+                  if os.path.getsize(path) > MAX_FILE_BYTES:
+                      continue
+                  with open(path, encoding="utf-8", errors="ignore") as fh:
+                      lines = fh.read().splitlines()
+              except OSError:
+                  continue
+              for i, line in enumerate(lines, start=1):
+                  for severity, rule_id, pattern, title, desc, rec in INJECTION_RULES:
+                      m = pattern.search(line)
+                      if m:
+                          add("prompt_injection", severity, rule_id, title, path, i, desc, m.group(0), rec)
+                          break
+
+          with open("agent-analysis.json", "w") as fh:
+              json.dump({"tool": "agent-analyzer", "findings": findings}, fh, indent=2)
+          print("agent analyzers: %d findings" % len(findings))
+          PYEOF
+          set +e
+          python3 agent-analyze.py > agent-analyze-run.log 2>&1
+          CODE=$?
+          set -e
+          if [ $CODE -eq 0 ] && [ -s agent-analysis.json ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=error" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # ---------------------------------------------------------------------------
       # Normalization + scoring. Produces:
       #   findings.json    - normalized, per-finding records (ingested by the
       #                      orchestrator into scan_findings in Phase 2)
@@ -195,6 +412,7 @@ jobs:
           TOOL_TRUFFLEHOG: ${{ steps.trufflehog.outputs.status }}
           TOOL_SEMGREP: ${{ steps.semgrep.outputs.status }}
           TOOL_OSV: ${{ steps.osv.outputs.status }}
+          TOOL_AGENT: ${{ steps.agent-analyze.outputs.status }}
         run: |
           cat > normalize.py <<'PYEOF'
           import json
@@ -341,6 +559,29 @@ jobs:
                               "recommendation": "Upgrade %s to a fixed version. See %s" % (pname, vuln.get("id") or "OSV database"),
                           })
 
+          # --- agent-analyzer (permissions + prompt injection) ---
+          agent = read_json("agent-analysis.json")
+          if os.environ.get("TOOL_AGENT") != "success" or not isinstance(agent, dict):
+              tool_errors.append("agent-analyzer")
+          else:
+              for f in agent.get("findings") or []:
+                  if not isinstance(f, dict):
+                      continue
+                  sev = f.get("severity") if f.get("severity") in ("critical", "high", "medium", "low") else "low"
+                  findings.append({
+                      "tool": "agent-analyzer",
+                      "category": f.get("category") if f.get("category") in ("permissions", "prompt_injection") else "prompt_injection",
+                      "severity": sev,
+                      "rule_id": str(f.get("rule_id") or "agent-analyzer"),
+                      "title": clip(f.get("title") or "agent finding", 160),
+                      "file_path": str(f.get("file_path") or "unknown"),
+                      "line_start": int(f.get("line_start") or 0),
+                      "line_end": int(f.get("line_end") or 0),
+                      "description": clip(f.get("description") or ""),
+                      "evidence": clip(f.get("evidence") or ""),
+                      "recommendation": clip(f.get("recommendation") or ""),
+                  })
+
           # Cap total findings to bound artifact size.
           findings = findings[:MAX_FINDINGS]
 
@@ -348,12 +589,18 @@ jobs:
           cat_counts = {}
           for f in findings:
               cat_counts.setdefault(f["category"], Counter())[f["severity"]] += 1
+          ERROR_CATS = {
+              "trufflehog": ["secrets"],
+              "semgrep": ["sast"],
+              "osv-scanner": ["dependencies"],
+              "agent-analyzer": ["prompt_injection", "permissions"],
+          }
           error_cats = {}
           for err in tool_errors:
-              cat = {"trufflehog": "secrets", "semgrep": "sast", "osv-scanner": "dependencies"}[err]
-              error_cats[cat] = err
-              cat_counts.setdefault(cat, Counter())["high"] += 1
-              counts["high"] += 1
+              for cat in ERROR_CATS.get(err, []):
+                  error_cats[cat] = err
+                  cat_counts.setdefault(cat, Counter())["high"] += 1
+                  counts["high"] += 1
 
           def rating_for(c):
               score = 100 - 25 * c.get("critical", 0) - 10 * c.get("high", 0) \
@@ -382,21 +629,17 @@ jobs:
           else: risk = "none"
 
           cat_ratings = {}
-          for cat in ["secrets", "sast", "dependencies"]:
+          for cat in ["secrets", "sast", "dependencies", "prompt_injection", "permissions"]:
               _, letter = rating_for(cat_counts.get(cat, Counter()))
               if cat in error_cats:
                   # Scanner error: coverage unknown, never better than C.
                   letter = worse(letter, "C")
               cat_ratings[cat] = letter
-          # Not yet implemented analyzers; disclosed in summary. B = partial
-          # coverage, deliberately publishable so the gate is not distorted.
-          cat_ratings["promptInjection"] = "B"
-          cat_ratings["permissions"] = "B"
 
           coverage = []
           if tool_errors:
               coverage.append("Tool errors: %s (treated as high-severity gaps)." % ", ".join(tool_errors))
-          coverage.append("Prompt-injection and permissions analyzers are not yet enabled; those ratings are placeholders.")
+          coverage.append("Agent analyzers cover MCP/agent manifest permissions and prompt-injection heuristics.")
 
           recs = []
           if counts.get("critical") or counts.get("high"):
@@ -407,6 +650,10 @@ jobs:
               recs.append("Upgrade vulnerable dependencies to fixed versions.")
           if cat_counts.get("sast"):
               recs.append("Review static-analysis findings and remediate per rule guidance.")
+          if cat_counts.get("prompt_injection"):
+              recs.append("Review prompt-injection findings and sanitize prompt/template content.")
+          if cat_counts.get("permissions"):
+              recs.append("Review MCP/agent capability findings and scope tool permissions to the minimum required.")
           if tool_errors:
               recs.append("Re-run the scan: one or more scanners failed to produce output.")
           if not recs:
@@ -438,12 +685,12 @@ jobs:
               },
               "categoryRatings": {
                   "secrets": cat_ratings["secrets"],
-                  "promptInjection": cat_ratings["promptInjection"],
+                  "promptInjection": cat_ratings["prompt_injection"],
                   "dependencies": cat_ratings["dependencies"],
                   "permissions": cat_ratings["permissions"],
                   "sast": cat_ratings["sast"],
               },
-              "summary": "Scan completed with TruffleHog, Semgrep and osv-scanner. %d findings. %s"
+              "summary": "Scan completed with TruffleHog, Semgrep, osv-scanner and agent analyzers. %d findings. %s"
                          % (len(findings), " ".join(coverage)),
               "recommendations": recs,
           }
@@ -467,9 +714,9 @@ jobs:
           lines.append("- Findings: critical=%d high=%d medium=%d low=%d (total=%d)"
                        % (counts.get("critical", 0), counts.get("high", 0),
                           counts.get("medium", 0), counts.get("low", 0), len(findings)))
-          lines.append("- Category ratings: secrets=%s sast=%s dependencies=%s promptInjection=%s(B placeholder) permissions=%s(B placeholder)"
+          lines.append("- Category ratings: secrets=%s sast=%s dependencies=%s promptInjection=%s permissions=%s"
                        % (cat_ratings["secrets"], cat_ratings["sast"], cat_ratings["dependencies"],
-                          cat_ratings["promptInjection"], cat_ratings["permissions"]))
+                          cat_ratings["prompt_injection"], cat_ratings["permissions"]))
           if tool_errors:
               lines.append("- Tool errors: %s" % ", ".join(tool_errors))
           lines.append("")
@@ -477,7 +724,7 @@ jobs:
           lines.append("- TruffleHog (secrets): %s" % ("error" if "trufflehog" in tool_errors else "ok"))
           lines.append("- Semgrep p/security-audit,p/default,p/python,p/typescript,p/javascript (SAST): %s" % ("error" if "semgrep" in tool_errors else "ok"))
           lines.append("- osv-scanner (dependencies): %s" % ("error" if "osv-scanner" in tool_errors else "ok"))
-          lines.append("- Prompt-injection / permissions analyzers: not yet implemented")
+          lines.append("- agent-analyzer (MCP/permissions + prompt injection): %s" % ("error" if "agent-analyzer" in tool_errors else "ok"))
           lines.append("")
           if findings:
               lines.append("## Findings")
@@ -546,5 +793,6 @@ jobs:
             trufflehog-output.json
             semgrep-output.json
             osv-output.json
+            agent-analysis.json
           retention-days: 7
           if-no-files-found: warn
