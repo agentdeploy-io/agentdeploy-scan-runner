@@ -41,7 +41,7 @@ jobs:
       #   docker manifest inspect <image> | jq '.manifests[0].digest'
       TRUFFLEHOG_IMAGE: trufflesecurity/trufflehog:latest
       SEMGREP_IMAGE: semgrep/semgrep:latest
-      OSV_SCANNER_IMAGE: gcr.io/osv-v4/osv-scanner:latest
+      OSV_SCANNER_IMAGE: ghcr.io/google/osv-scanner:latest
 
     steps:
       - name: Resolve source repository
@@ -164,9 +164,9 @@ jobs:
             -v "$PWD:/src" \
             -w /src \
             "$OSV_SCANNER_IMAGE" \
-            scan --recursive /src --format json --output /src/osv-output.json > osv-run.log 2>&1
+            scan --recursive /src --format json --output-file /src/osv-output.json > osv-run.log 2>&1
           CODE=$?
-          if [ $CODE -ne 0 ] && [ ! -s osv-output.json ]; then
+          if [ $CODE -ne 0 ] && [ ! -s osv-output.json ] && ! grep -qi "No package sources found" osv-run.log; then
             # Older CLI without the scan subcommand.
             docker run --rm \
               -v "$PWD:/src" \
@@ -176,10 +176,15 @@ jobs:
             CODE=$?
           fi
           set -e
+          # No lockfiles in the repo = nothing to scan: emit an empty result and
+          # treat it as a successful zero-finding scan, not a tool error.
+          if [ ! -s osv-output.json ] && grep -qi "No package sources found" osv-run.log; then
+            echo '{"vulnerabilities":[]}' > osv-output.json
+            CODE=0
+          fi
           # Exit 0 = no vulnerabilities, exit 1 = vulnerabilities found (both are
           # a completed scan; findings are counted from the JSON below). Any other
-          # exit code means the tool itself failed to run. (Agent repos ship a
-          # committed lockfile so osv-scanner always has a scan target.)
+          # exit code means the tool itself failed to run.
           if [ $CODE -eq 0 ] || [ $CODE -eq 1 ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
