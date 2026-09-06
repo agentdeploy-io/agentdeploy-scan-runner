@@ -15,6 +15,9 @@ on:
       source_installation_id:
         description: 'GitHub App installation id for source repo (optional)'
         required: false
+      source_pat:
+        description: 'Fallback personal access token for source repo checkout (optional)'
+        required: false
       template_id:
         description: 'Template id in AgentDeploy (optional)'
         required: false
@@ -68,6 +71,7 @@ jobs:
       - name: Create GitHub App token for source repository
         id: source-token
         if: ${{ env.SCANNER_APP_ID != '' && env.SCANNER_APP_PRIVATE_KEY != '' }}
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.SCANNER_APP_ID }}
@@ -89,7 +93,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ steps.source-repo.outputs.full }}
-          token: ${{ steps.source-token.outputs.token || github.token }}
+          token: ${{ inputs.source_pat || steps.source-token.outputs.token || github.token }}
           fetch-depth: 1
 
       - name: Capture source commit
