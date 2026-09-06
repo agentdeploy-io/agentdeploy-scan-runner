@@ -774,9 +774,9 @@ jobs:
           with open("report.md", "w") as fh:
               fh.write("\n".join(lines) + "\n")
 
-           print("normalized %d findings; tool errors: %s" % (len(findings), tool_errors or "none"))
-           PYEOF
-           python3 normalize.py
+          print("normalized %d findings; tool errors: %s" % (len(findings), tool_errors or "none"))
+          PYEOF
+          python3 normalize.py
 
       - name: Install PDF tooling
         if: ${{ always() }}
