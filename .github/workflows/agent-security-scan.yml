@@ -102,6 +102,15 @@ jobs:
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Redact checkout credentials from git config
+        if: ${{ inputs.source_pat != '' }}
+        shell: bash
+        env:
+          SOURCE_REPO_FULL: ${{ steps.source-repo.outputs.full }}
+        run: |
+          git remote set-url origin "https://github.com/${SOURCE_REPO_FULL}"
+          git config --local --unset http.https://github.com/.extraheader 2>/dev/null || true
+
       # ---------------------------------------------------------------------------
       # Scanner execution.
       #
