@@ -47,10 +47,13 @@ jobs:
       - name: Resolve source repository
         id: source-repo
         shell: bash
+        env:
+          INPUT_SOURCE_REPO: ${{ github.event.inputs.source_repo }}
+          CURRENT_REPOSITORY: ${{ github.repository }}
         run: |
-          SOURCE_REPO="${{ github.event.inputs.source_repo }}"
+          SOURCE_REPO="$INPUT_SOURCE_REPO"
           if [ -z "$SOURCE_REPO" ]; then
-            SOURCE_REPO="${{ github.repository }}"
+            SOURCE_REPO="$CURRENT_REPOSITORY"
           fi
           OWNER="${SOURCE_REPO%%/*}"
           REPO="${SOURCE_REPO#*/}"
@@ -65,7 +68,7 @@ jobs:
       - name: Create GitHub App token for source repository
         id: source-token
         if: ${{ env.SCANNER_APP_ID != '' && env.SCANNER_APP_PRIVATE_KEY != '' }}
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.SCANNER_APP_ID }}
           private-key: ${{ secrets.SCANNER_APP_PRIVATE_KEY }}
@@ -83,7 +86,7 @@ jobs:
           exit 1
 
       - name: Checkout source repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ steps.source-repo.outputs.full }}
           token: ${{ steps.source-token.outputs.token || github.token }}
@@ -115,9 +118,10 @@ jobs:
             filesystem /repo --results=verified,unknown --json > trufflehog-output.json 2> trufflehog-stderr.log
           CODE=$?
           set -e
-          # TruffleHog may exit non-zero when findings are present; findings are
-          # counted from JSON below. Only treat as tool error when no output.
-          if [ -s trufflehog-output.json ]; then
+          # Exit 0 = scan completed (a clean repo yields an empty JSON file -
+          # that is a valid "no findings" result, NOT a tool error). Exit 183
+          # = findings present (only with --fail). Other non-zero = tool failed.
+          if [ $CODE -eq 0 ] || [ $CODE -eq 183 ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
             echo "status=error" >> "$GITHUB_OUTPUT"
@@ -142,8 +146,9 @@ jobs:
               --json --output /src/semgrep-output.json > semgrep-run.log 2>&1
           CODE=$?
           set -e
-          # Without --error, a non-zero exit means the tool itself failed.
-          if [ $CODE -eq 0 ] && [ -s semgrep-output.json ]; then
+          # Without --error, a non-zero exit means the tool itself failed;
+          # findings (if any) are always written to semgrep-output.json.
+          if [ $CODE -eq 0 ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
             echo "status=error" >> "$GITHUB_OUTPUT"
@@ -171,9 +176,11 @@ jobs:
             CODE=$?
           fi
           set -e
-          # osv-scanner exits 1 when vulnerabilities are found; findings are
-          # counted from JSON. Tool error only when no parsable output.
-          if [ -s osv-output.json ]; then
+          # Exit 0 = no vulnerabilities, exit 1 = vulnerabilities found (both are
+          # a completed scan; findings are counted from the JSON below). Any other
+          # exit code means the tool itself failed to run. (Agent repos ship a
+          # committed lockfile so osv-scanner always has a scan target.)
+          if [ $CODE -eq 0 ] || [ $CODE -eq 1 ]; then
             echo "status=success" >> "$GITHUB_OUTPUT"
           else
             echo "status=error" >> "$GITHUB_OUTPUT"
@@ -413,6 +420,13 @@ jobs:
           TOOL_SEMGREP: ${{ steps.semgrep.outputs.status }}
           TOOL_OSV: ${{ steps.osv.outputs.status }}
           TOOL_AGENT: ${{ steps.agent-analyze.outputs.status }}
+          SCAN_JOB_ID: ${{ github.event.inputs.scan_job_id }}
+          TEMPLATE_ID: ${{ github.event.inputs.template_id }}
+          TEMPLATE_VERSION: ${{ github.event.inputs.template_version }}
+          REPORT_TITLE: ${{ github.event.inputs.report_title }}
+          SOURCE_REPO: ${{ steps.source-repo.outputs.full }}
+          SOURCE_COMMIT: ${{ steps.source-commit.outputs.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           cat > normalize.py <<'PYEOF'
           import json
@@ -452,11 +466,13 @@ jobs:
 
           # --- TruffleHog ---
           th = read_json("trufflehog-output.json", jsonl=True)
-          if os.environ.get("TOOL_TRUFFLEHOG") != "success" or th is None:
+          if os.environ.get("TOOL_TRUFFLEHOG") != "success":
               tool_errors.append("trufflehog")
           else:
+              # A successful scan with no/empty output is a clean repo (no findings),
+              # not a tool error.
               seen = set()
-              for r in th:
+              for r in (th or []):
                   meta = (r.get("SourceMetadata") or {}).get("Data") or {}
                   git = meta.get("Git") or {}
                   fs = meta.get("Filesystem") or meta.get("filesystem") or {}
@@ -506,9 +522,14 @@ jobs:
 
           # --- osv-scanner ---
           osv = read_json("osv-output.json")
-          if os.environ.get("TOOL_OSV") != "success" or not isinstance(osv, dict):
+          if os.environ.get("TOOL_OSV") != "success":
               tool_errors.append("osv-scanner")
           else:
+              # A successful scan with no/empty output (e.g. no lockfiles) is
+              # "nothing to scan", not a tool error.
+              if not isinstance(osv, dict):
+                  osv = {}
+
               def osv_severity(vuln):
                   ds = (vuln.get("database_specific") or {}).get("severity")
                   if isinstance(ds, str):
@@ -748,16 +769,9 @@ jobs:
           with open("report.md", "w") as fh:
               fh.write("\n".join(lines) + "\n")
 
-          print("normalized %d findings; tool errors: %s" % (len(findings), tool_errors or "none"))
-          PYEOF
-          SCAN_JOB_ID="${{ github.event.inputs.scan_job_id }}" \
-          TEMPLATE_ID="${{ github.event.inputs.template_id }}" \
-          TEMPLATE_VERSION="${{ github.event.inputs.template_version }}" \
-          REPORT_TITLE="${{ github.event.inputs.report_title }}" \
-          SOURCE_REPO="${{ steps.source-repo.outputs.full }}" \
-          SOURCE_COMMIT="${{ steps.source-commit.outputs.sha }}" \
-          RUN_ID="${{ github.run_id }}" \
-          python3 normalize.py
+           print("normalized %d findings; tool errors: %s" % (len(findings), tool_errors or "none"))
+           PYEOF
+           python3 normalize.py
 
       - name: Install PDF tooling
         if: ${{ always() }}
@@ -783,7 +797,7 @@ jobs:
 
       - name: Upload report artifact
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Certified-Security-Report
           path: |
